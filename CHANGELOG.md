@@ -5,6 +5,10 @@
 
 ## [未发布]
 
+### 修复
+
+- **进行中的多日周期 Bar（1w/1mon/1q/1hy/1y）按请求窗口截断**（#226）。盘中大 QMT 把进行中的周线按请求窗口内的基础数据现场合成——窗口只含当日时，周线的 volume/OHLC 只剩当日部分，本周前几天的量丢失（miniQMT 的 `get_local_data` 语义是从本地全部数据合成、窗口只过滤返回行）。现在客户端在返回前对进行中的 Bar 用周期内日线重造（volume/amount 求和、high/low 取极值、open 取周期首日开盘、close 取最新收盘；preClose/time 不动）。结构性触发：周期集合钉死 + 最后一根 Bar 的自然周期包含今天 + 请求窗口切进周期 + 盘中时段——收盘后已定型、窗口已覆盖周期、日线请求失败或为空时都原样放行（失败保留原值并告警，不抛错）。`resynth_ongoing_multiday=False` 可关。盘后实测：重造值与定型 Bar 逐值一致。
+
 ### 新增
 
 - **异步撤单与批量撤单**（#224，贡献者 @shihaibi）：`cancel_order_stock_async` / `cancel_order_stock_sysid_async` 从内联阻塞改为队列异步（复用异步下单的 worker + 回调分发线程），积压按账户分组成一次 `cancel_order_stock_batch` RPC（单项上限 500，超时随 N 缩放）。`cancel_order_stock_batch(account, cancels)` 同步批量接口同批新增，每项应答带 `accepted`/`confirmed`。**行为变化**：`cancel_order_stock_async` 的回调不再在返回前内联触发，改为回调线程异步到达。
