@@ -307,7 +307,22 @@ def credit_optype_of(order_type):
         return None
 
 
-def _action_from_offset_flag(offset_flag):
+def _action_from_offset_flag(offset_flag, op_type=None, account_type=None):
+    """BUY/SELL for a normalized query row, from m_nOffsetFlag or m_nOpType.
+
+    For stocks, m_nOffsetFlag IS the side (48=buy, 49=sell). For futures and
+    ETF options, offset means open/close instead (48=open, 49=close): a
+    sell-to-open row carries offset=48 and reads as BUY under the stock
+    mapping, and a buy-to-close row reads as SELL. When the row belongs to a
+    passthrough account (FUTURE / STOCK_OPTION), prefer the side of m_nOpType
+    via passthrough_action_of() (futures 0-15, ETF options 50-55); offset
+    stays as the fallback for rows without a usable opType (e.g. 56/57
+    exercise rows, which have no side at all).
+    """
+    if account_type and str(account_type).upper() in PASSTHROUGH_ACCOUNT_TYPES:
+        action = passthrough_action_of(op_type)
+        if action is not None:
+            return action
     return SignalAction.BUY.value if int(offset_flag or 0) == 48 else SignalAction.SELL.value
 
 
@@ -666,7 +681,11 @@ class BigQmtOrderGateway:
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                     stock_code=stock_code,
-                    action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
+                    action=_action_from_offset_flag(
+                        _attr(row, ("m_nOffsetFlag", "offset_flag"), 0),
+                        _attr(row, ("m_nOpType", "op_type"), None),
+                        self._resolve_account_type(account_id),
+                    ),
                     volume=int(_attr(row, ("m_nVolumeTotalOriginal", "volume"), 0) or 0),
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
@@ -763,7 +782,11 @@ class BigQmtOrderGateway:
                     trade_id=str(_attr(row, ("m_strTradeID", "trade_id"), "") or ""),
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
                     stock_code=stock_code,
-                    action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
+                    action=_action_from_offset_flag(
+                        _attr(row, ("m_nOffsetFlag", "offset_flag"), 0),
+                        _attr(row, ("m_nOpType", "op_type"), None),
+                        self._resolve_account_type(account_id),
+                    ),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
                     traded_at=str(traded_at_raw or ""),
