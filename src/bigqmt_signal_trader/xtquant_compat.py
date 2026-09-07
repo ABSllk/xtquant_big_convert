@@ -570,6 +570,66 @@ def _iso_week_start_label(value):
     return (day - _dt.timedelta(days=day.weekday())).strftime("%Y%m%d")
 
 
+def _month_start_label(value):
+    """The 1st of the month a bar label belongs to, as YYYYMMDD."""
+    parsed = _parse_qmt_stime(value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y%m") + "01"
+
+
+def _quarter_start_label(value):
+    """The 1st of the quarter's first month a bar label belongs to."""
+    parsed = _parse_qmt_stime(value)
+    if parsed is None:
+        return None
+    month = ((parsed.month - 1) // 3) * 3 + 1
+    return "%04d%02d01" % (parsed.year, month)
+
+
+def _halfyear_start_label(value):
+    """Jan 1 or Jul 1 of the half-year a bar label belongs to."""
+    parsed = _parse_qmt_stime(value)
+    if parsed is None:
+        return None
+    return "%04d0101" % parsed.year if parsed.month <= 6 else "%04d0701" % parsed.year
+
+
+def _year_start_label(value):
+    """Jan 1 of the year a bar label belongs to."""
+    parsed = _parse_qmt_stime(value)
+    if parsed is None:
+        return None
+    return "%04d0101" % parsed.year
+
+
+def _period_end_label(period, value):
+    """The last calendar day of the natural period a bar label belongs to.
+
+    Used only to tell an in-progress bar (its period is not over yet) from a
+    finalized one. Returns None for anything unparseable.
+    """
+    parsed = _parse_qmt_stime(value)
+    if parsed is None:
+        return None
+    day = parsed.date()
+    if period == "1w":
+        return (day - _dt.timedelta(days=day.weekday()) + _dt.timedelta(days=6)).strftime("%Y%m%d")
+    if period == "1mon":
+        year, month = parsed.year, parsed.month
+        end = _dt.date(year + month // 12, month % 12 + 1, 1) - _dt.timedelta(days=1)
+        return end.strftime("%Y%m%d")
+    if period == "1q":
+        month = ((parsed.month - 1) // 3) * 3 + 3
+        end = _dt.date(parsed.year + month // 12, month % 12 + 1, 1) - _dt.timedelta(days=1)
+        return end.strftime("%Y%m%d")
+    if period == "1hy":
+        return "%04d0630" % parsed.year if parsed.month <= 6 else "%04d1231" % parsed.year
+    if period == "1y":
+        return "%04d1231" % parsed.year
+    return None
+
+
 def _bar_float(value):
     """A bar cell as a float, or None for anything that is not a number.
 
@@ -1187,6 +1247,32 @@ PRE_CLOSE_BACKFILL_PERIODS = ("1w",)
 _PRE_CLOSE_PERIOD_STARTS = {"1w": _iso_week_start_label}
 _PRE_CLOSE_NOTICE = {"shown": False}
 
+# Periods whose ongoing bar QMT synthesizes from the request window instead
+# of from all local data (#226). Pinned as a set the way #172 pinned its
+# period list -- a new period enters only with a measurement behind it.
+RESYNTH_ONGOING_PERIODS = ("1w", "1mon", "1q", "1hy", "1y")
+RESYNTH_PERIOD_STARTS = {
+    "1w": _iso_week_start_label,
+    "1mon": _month_start_label,
+    "1q": _quarter_start_label,
+    "1hy": _halfyear_start_label,
+    "1y": _year_start_label,
+}
+_RESYNTH_NOTICE = {"shown": False}
+
+
+def _in_trading_session(now):
+    """Weekday inside the continuous-auction window (with a settle margin
+    after close). After the close the ongoing multi-day bar is finalized and
+    passes through untouched (#226's after-close control)."""
+    if now.weekday() > 4:
+        return False
+    return _dt.time(9, 30) <= now.time() <= _dt.time(15, 5)
+
+
+def _now():
+    return _dt.datetime.now()
+
 
 def _notice_field_list_cost(field_list):
     """Say once that naming fields is what enables the fast path.
@@ -1731,6 +1817,154 @@ class BigQmtXtData:
         rows.sort()
         return rows
 
+    def _resynth_ongoing_multiday_bars(self, data, period, start_time,
+                                       end_time, dividend_type,
+                                       timeout_seconds=None, use_formula=True):
+        """Rebuild the in-progress multi-day bar from the period's daily bars (#226).
+
+        Big QMT synthesizes an ongoing 1w/1mon/1q/1hy/1y bar from the bars in
+        the REQUEST window, so a window covering only today answers the weekly
+        bar with today's volume and the week's earlier days lost. MiniQMT's
+        get_local_data synthesizes from ALL local base data and start/end only
+        filters the returned rows -- this rebuild is what makes the bridge
+        match that.
+
+        Structural triggers only, never a value guess: the period is in
+        RESYNTH_ONGOING_PERIODS, the last bar's natural period contains today,
+        the request window cuts into the period (start_time past its start),
+        and the clock is inside a weekday session -- after close the bar is
+        finalized and passes through untouched.
+
+        Degrades like the preClose backfill (#166): a failed or empty daily
+        read keeps the terminal's answer and warns once; nothing raises.
+        """
+        if str(period or "") not in RESYNTH_ONGOING_PERIODS or not isinstance(data, dict):
+            return data
+        start_text = str(start_time or "")
+        if not start_text:
+            return data          # count-based reads never showed the truncation
+        now = _now()
+        if not _in_trading_session(now):
+            return data
+        today = now.strftime("%Y%m%d")
+
+        targets = {}
+        for code, frame in data.items():
+            labels = _frame_bar_labels(frame)
+            if not labels:
+                continue
+            label = labels[-1]
+            period_start = RESYNTH_PERIOD_STARTS[period](label)
+            period_end = _period_end_label(period, label)
+            if period_start is None or period_end is None:
+                continue
+            if not (period_start <= today <= period_end):
+                continue          # the last bar is finalized history
+            if _digits_only(start_text)[:8] <= period_start:
+                continue          # the window already covers the period
+            targets[code] = period_start
+        if not targets:
+            return data
+
+        try:
+            daily = self.get_market_data_ex(
+                field_list=["open", "high", "low", "close", "volume", "amount"],
+                stock_list=sorted(targets), period="1d",
+                start_time=min(targets.values()), end_time=today, count=-1,
+                dividend_type=dividend_type, fill_data=False,
+                timeout_seconds=timeout_seconds, use_formula=use_formula,
+                backfill_pre_close=False, resynth_ongoing_multiday=False,
+            )
+        except Exception as exc:
+            # The terminal's answer was good enough to serve; taking the whole
+            # read down over the rebuild would be the worse bug.
+            log.warning("ongoing %s bar rebuild skipped: %s", period, exc)
+            return data
+
+        rebuilt = 0
+        for code, period_start in targets.items():
+            frame = data.get(code)
+            daily_frame = daily.get(code) if isinstance(daily, dict) else None
+            summary = self._sum_daily_bars(daily_frame, period_start, today)
+            if summary is None:
+                continue
+            if self._write_last_bar(frame, summary):
+                rebuilt += 1
+        if rebuilt:
+            self._notice_resynth_ongoing(period, rebuilt)
+        return data
+
+    @staticmethod
+    def _sum_daily_bars(frame, period_start, today):
+        """open/high/low/close/volume/amount for one ongoing period from its
+        daily bars, or None when there is nothing to sum."""
+        labels = _frame_bar_labels(frame) if frame is not None else None
+        if not labels:
+            return None
+        try:
+            columns = {name: list(frame[name]) for name in
+                       ("open", "high", "low", "close", "volume", "amount")}
+        except Exception:
+            return None
+        rows = []
+        for index, label in enumerate(labels):
+            day = _digits_only(label)[:8]
+            if not day or day < period_start or day > today:
+                continue
+            rows.append({name: _bar_float(columns[name][index])
+                         for name in columns})
+        rows = [row for row in rows if row["close"] is not None]
+        if not rows:
+            return None
+        out = {
+            "open": next((row["open"] for row in rows if row["open"] is not None), None),
+            "high": max((row["high"] for row in rows if row["high"] is not None), default=None),
+            "low": min((row["low"] for row in rows if row["low"] is not None), default=None),
+            "close": next((row["close"] for row in reversed(rows) if row["close"] is not None), None),
+        }
+        for name in ("volume", "amount"):
+            values = [row[name] for row in rows if row[name] is not None]
+            out[name] = sum(values) if values else None
+        return out
+
+    @staticmethod
+    def _write_last_bar(frame, summary):
+        """Write the rebuilt values into the last bar, only into columns the
+        caller actually asked for. True when anything was written."""
+        wrote = False
+        for name, value in summary.items():
+            if value is None:
+                continue
+            try:
+                values = list(frame[name])
+            except Exception:
+                continue          # the column was never requested
+            if not values:
+                continue
+            values[-1] = value
+            try:
+                frame[name] = values
+                wrote = True
+            except Exception:
+                continue
+        return wrote
+
+    @staticmethod
+    def _notice_resynth_ongoing(period, count):
+        """Say once that ongoing bars are rebuilt here, not answered by QMT."""
+        if _RESYNTH_NOTICE["shown"]:
+            return
+        _RESYNTH_NOTICE["shown"] = True
+        try:
+            log.info(
+                "the ongoing %s bar(s) of %d code(s) were rebuilt from the "
+                "period's daily bars (issue #226): big QMT synthesizes them "
+                "from the request window, miniQMT from all local data. Pass "
+                "resynth_ongoing_multiday=False to serve the raw window "
+                "answer.", period, count)
+        except Exception:
+            pass
+
     @staticmethod
     def _notice_pre_close_backfill(period):
         """Say once that these preClose values are derived, not the terminal's."""
@@ -1762,6 +1996,7 @@ class BigQmtXtData:
         timeout_seconds=None,
         use_formula=True,
         backfill_pre_close=True,
+        resynth_ongoing_multiday=True,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
 
@@ -1837,6 +2072,15 @@ class BigQmtXtData:
             data = self._backfill_pre_close(
                 data, period=period, dividend_type=dividend_type,
                 timeout_seconds=timeout_seconds, use_formula=use_formula,
+            )
+
+        if resynth_ongoing_multiday:
+            # Same rule as the backfill: the cache keeps the rebuilt bar, not
+            # the window-truncated one (#226).
+            data = self._resynth_ongoing_multiday_bars(
+                data, period=period, start_time=start_time, end_time=end_time,
+                dividend_type=dividend_type, timeout_seconds=timeout_seconds,
+                use_formula=use_formula,
             )
 
         cache = self._local_cache()
