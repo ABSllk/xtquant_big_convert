@@ -202,6 +202,68 @@ def _quote_push_zmq_address(client):
     return "tcp://%s:%d" % (host, base_port + 1)
 
 
+def _tick_time_ms(value):
+    """Translate a Big-QMT time label or epoch into milliseconds."""
+    parsed = _parse_qmt_stime(value)
+    if parsed is not None:
+        return _qmt_datetime_to_epoch_ms(parsed)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    magnitude = abs(number)
+    if magnitude >= 1000000000000:
+        return int(number)
+    if magnitude >= 1000000000:
+        return int(number * 1000)
+    return None
+
+
+def _normalize_tick_row(row):
+    """Supply MiniQMT's ``time`` field for full-QMT tick variants."""
+    if not isinstance(row, dict) or row.get("time") not in (None, ""):
+        return row
+    for key in ("stime", "timetag", "datetime", "date"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        timestamp = _tick_time_ms(value)
+        if timestamp is not None:
+            normalized = dict(row)
+            normalized["time"] = timestamp
+            return normalized
+    return row
+
+
+def _normalize_full_tick_payload(data):
+    if not isinstance(data, dict):
+        return data
+    return dict((code, _normalize_tick_row(row)) for code, row in data.items())
+
+
+def _subscribe_quote_payload(data):
+    """Convert whole-quote rows to MiniQMT ``subscribe_quote`` shape.
+
+    ``subscribe_whole_quote`` and ``get_full_tick`` expose ``{code: tick}``,
+    while MiniQMT's single-instrument subscription callback promises
+    ``{code: [tick, ...]}``. Keep an already batched value unchanged so this
+    also tolerates a future source that already returns the MiniQMT shape.
+    """
+    if not isinstance(data, dict):
+        return data
+    payload = {}
+    for code, rows in data.items():
+        if isinstance(rows, list):
+            payload[code] = [_normalize_tick_row(row) for row in rows]
+        elif isinstance(rows, tuple):
+            payload[code] = [_normalize_tick_row(row) for row in rows]
+        else:
+            payload[code] = [_normalize_tick_row(rows)]
+    return payload
+
+
 def _missing_account_id_message():
     """Say what was searched and what to do, not just that something is missing.
 
@@ -1593,7 +1655,7 @@ class BigQmtXtData:
                 poll_interval_seconds=cache_config.get("poll_interval_seconds", 0.2),
             )
             if data is not None:
-                return data
+                return _normalize_full_tick_payload(data)
             upper_codes = {str(code).strip().upper() for code in codes}
             if upper_codes & {"SH", "SZ", "BJ", "HK"}:
                 # Whole-market snapshots must stay on the demand cache. A live RPC
@@ -1602,7 +1664,11 @@ class BigQmtXtData:
             # Symbol-list miss (cold start / expired snapshot): fall back to a live
             # RPC so the first call is ~ms instead of a hard wait_seconds stall.
             rpc_timeout = timeout_seconds if timeout_seconds is not None else None
-            return self.client.call("get_full_tick", _full_tick_params(codes, types), timeout_seconds=rpc_timeout) or {}
+            data = self.client.call(
+                "get_full_tick", _full_tick_params(codes, types),
+                timeout_seconds=rpc_timeout,
+            ) or {}
+            return _normalize_full_tick_payload(data)
         upper_codes = {str(code).strip().upper() for code in codes}
         # Caller-provided timeout takes priority; otherwise auto-detect whole-market.
         if timeout_seconds is not None:
@@ -1624,7 +1690,7 @@ class BigQmtXtData:
             recovered = self._full_tick_via_markets(
                 codes, rpc_timeout, types, errors=fallback_errors)
             if recovered is not None:
-                return recovered
+                return _normalize_full_tick_payload(recovered)
             if failure is not None:
                 # A bare `raise` here has no active exception -- the except
                 # block above has already exited -- so it produced
@@ -1645,7 +1711,7 @@ class BigQmtXtData:
                         "could not be recovered from a market read.",
                         len(codes), failure)
                 raise failure
-        return data or {}
+        return _normalize_full_tick_payload(data or {})
 
     def _can_fall_back_to_markets(self, codes, upper_codes):
         """Only an explicit list of suffixed codes can be recovered this way."""
@@ -2422,14 +2488,25 @@ class BigQmtXtData:
         if str(period).lower() in ("tick", "full_tick"):
             session = self._whole_quote_session()
             session.start()
-            seq = session.subscribe_whole_quote([stock_code], callback=callback)
+
+            def on_tick(data):
+                if callback is not None:
+                    callback(_subscribe_quote_payload(data))
+
+            quote_callback = on_tick if callback is not None else None
+            seq = session.subscribe_whole_quote(
+                [stock_code], callback=quote_callback
+            )
             # The whole-quote callback is incremental; prime it with a snapshot
             # so a subscriber is not left with nothing until the first change.
-            if callback is not None:
+            if quote_callback is not None:
                 try:
-                    callback(self.get_full_tick([stock_code]))
+                    quote_callback(self.get_full_tick([stock_code]))
                 except Exception:
-                    pass
+                    log.exception(
+                        "subscribe_quote callback failed code=%s period=%s",
+                        stock_code, period,
+                    )
             self._record_subscription(seq, payload)
             return seq
 

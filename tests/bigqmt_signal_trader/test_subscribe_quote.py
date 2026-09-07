@@ -112,6 +112,63 @@ class TickSubscriptionTest(unittest.TestCase):
 
         self.assertGreaterEqual(len(seen), 3)  # 1 priming snapshot + 2 pushes
 
+    def test_tick_callback_keeps_miniqmt_list_shape(self):
+        """subscribe_quote differs from subscribe_whole_quote at the value
+        shape: MiniQMT promises ``{code: [tick, ...]}``, while the whole-quote
+        source supplies ``{code: tick}``. Consumers are allowed to iterate each
+        value before reading tick fields.
+        """
+        session = FakeSession()
+        data = _xtdata(session=session)
+        prices = []
+
+        def miniqmt_consumer(payload):
+            for rows in payload.values():
+                for tick in rows:
+                    prices.append(tick["lastPrice"])
+
+        data.subscribe_quote(
+            "600000.SH", period="tick", callback=miniqmt_consumer
+        )
+        session.push({"600000.SH": {"lastPrice": 10.1}})
+        session.push({"600000.SH": [{"lastPrice": 10.2}]})
+
+        self.assertEqual(prices, [1.0, 10.1, 10.2])
+
+    def test_tick_callback_converts_bigqmt_timetag_to_miniqmt_time(self):
+        """Some full-QMT builds expose ``timetag`` in snapshots and pushes,
+        while MiniQMT consumers require an epoch-millisecond ``time`` field.
+        """
+        class TimetagClient(FakeClient):
+            def call(self, method, params=None, **kwargs):
+                if method == "get_full_tick":
+                    return {
+                        "600000.SH": {
+                            "timetag": "20260907 11:47:52",
+                            "lastPrice": 10.0,
+                        }
+                    }
+                return super(TimetagClient, self).call(method, params, **kwargs)
+
+        session = FakeSession()
+        data = _xtdata(TimetagClient(), session=session)
+        times = []
+
+        def miniqmt_consumer(payload):
+            times.extend(tick["time"] for tick in payload["600000.SH"])
+
+        data.subscribe_quote(
+            "600000.SH", period="tick", callback=miniqmt_consumer
+        )
+        session.push({
+            "600000.SH": {
+                "timetag": "20260907 11:47:53",
+                "lastPrice": 10.1,
+            }
+        })
+
+        self.assertEqual(times, [1788752872000, 1788752873000])
+
     def test_the_subscriber_is_primed_with_a_snapshot(self):
         """Whole-quote pushes only changed symbols, so a fresh subscriber would
         otherwise see nothing until the instrument next ticks."""

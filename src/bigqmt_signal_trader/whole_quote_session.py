@@ -11,7 +11,11 @@ subscription does not by itself deliver an initial full snapshot — callers lay
 a ``get_full_tick`` prime on top (done in ``BigQmtXtData.subscribe_whole_quote``).
 """
 
+import logging
 import threading
+
+
+log = logging.getLogger("bigqmt.whole_quote_session")
 
 
 def _norm_topic(code_list):
@@ -185,7 +189,7 @@ class WholeQuoteClientSession(object):
             try:
                 callback(data)
             except Exception:
-                pass
+                log.exception("quote callback failed topic=%s", topic)
 
     def _sync_subscriber_locked(self):
         """(Re)start the push-channel subscriber to cover exactly the active
