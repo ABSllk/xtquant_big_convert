@@ -117,6 +117,25 @@ class EnrichWorksOnATradeEventTest(unittest.TestCase):
 
         self.assertEqual(enriched["strategy_name"], "alpha")
 
+    def test_the_store_wins_over_the_rows_bridge_process_name(self):
+        """#216: the row's strategy-name field is the QMT-side strategy's
+        registered name (the bridge process), never the caller's. An order
+        placed with strategy_name='DaBanStrategy' reported '大QMT桥接器'.
+        The submit-time identity record must override the row."""
+        import json
+
+        class Store(object):
+            def get(self, key):
+                return json.dumps({"strategy_name": "alpha"}).encode("utf-8")
+
+        event = exec_events.normalize_trade_event(
+            _deal_obj(m_strSource="大QMT桥接器"), "acct")
+        self.assertEqual(event["strategy_name"], "大QMT桥接器")  # the row's own answer
+
+        enriched = exec_events.enrich_order_identity(Store(), "acct", event)
+
+        self.assertEqual(enriched["strategy_name"], "alpha")
+
 
 # ------------------------------------------------------- the publish path
 
@@ -264,6 +283,17 @@ class LocalJournalFallbackTest(_PublishBase):
 
         self.assertEqual(self._events()[0]["strategy_name"], "alpha")
         self.assertEqual(self._fake.enriched, [])   # redis never consulted
+
+    def test_the_journal_wins_over_the_rows_bridge_process_name(self):
+        """#216 publish-path: the row came pre-named with the bridge's own
+        process name; the journal (this process's submit-time record) knows
+        the caller's real strategy name and must override it."""
+        self._wire_journal()
+
+        strategy._publish_exec_event(
+            "trade", _deal_obj(strategyName="大QMT桥接器"), None)
+
+        self.assertEqual(self._events()[0]["strategy_name"], "alpha")
 
     def test_redis_is_the_fallback_when_the_journal_misses(self):
         """Another process's order: nothing local, so redis still answers."""

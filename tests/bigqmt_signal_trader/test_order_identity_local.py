@@ -124,15 +124,18 @@ class LocalIdentityJournalTest(unittest.TestCase):
         self.assertIn(("acct", "r%d" % (handlers._ORDER_IDENTITY_LOCAL_LIMIT + 49)),
                       handlers._order_identity_local)
 
-    def test_existing_redis_answer_is_not_clobbered_by_local(self):
+    def test_the_journal_identity_wins_over_the_rows_bridge_name(self):
+        """#216 changed the precedence: the row's strategy-name field carries
+        the QMT-side strategy's registered name (the bridge process), never
+        the caller's -- so a submit-time identity record (this journal) is the
+        authoritative one and WINS over the row's value."""
         gateway = _QueryGateway([_row(user_order_id="sig-1", strategy_name="from_redis")])
         handlers = _handlers(gateway)
         _submit(handlers, "sig-1", "from_local")
 
         rows = handlers._handle_query_orders({})
 
-        # Row already named (by Redis/terminal): local journal must not overwrite.
-        self.assertEqual(rows[0].strategy_name, "from_redis")
+        self.assertEqual(rows[0].strategy_name, "from_local")
 
 
 class FilteredQueryNamesRowsTest(unittest.TestCase):

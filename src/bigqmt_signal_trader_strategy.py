@@ -1753,9 +1753,12 @@ def _enrich_event_identity(exec_events, config, account_id, event):
 
     Both branches call this. Enriching only orders is what left
     on_stock_trade's strategy_name permanently empty.
+
+    The row's own strategy-name field is NOT authoritative (#216): QMT fills
+    it with the QMT-side strategy's registered name (this bridge process),
+    not the strategy_name the caller passed at order time. So no early return
+    on a non-empty row value -- a submit-time identity with a name WINS.
     """
-    if str(event.get("strategy_name") or "").strip():
-        return event
     name = _local_identity_strategy_name(account_id, event)
     if name:
         event["strategy_name"] = name

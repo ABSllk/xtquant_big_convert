@@ -1493,22 +1493,26 @@ class BigQmtRpcHandlers:
         )
 
     def _attribute_to_strategies(self, account_id, snapshots):
-        """Put the strategy name back on rows QMT could not name (issue #133).
+        """Put the caller's strategy name on rows this bridge submitted.
 
         Neither the ORDER nor the DEAL rows get_trade_detail_data returns carry
         m_strStrategyName -- checked by listing every attribute on a live
-        terminal. QMT filters by strategy but does not report it, which is why
-        this field read as "" for everything.
+        terminal. What the row DOES carry (m_strSource) is the QMT-side
+        strategy's registered name -- this bridge process's name, e.g.
+        BIGQMT_REDIS_DRYRUN -- not the strategy_name the caller passed at order
+        time (#216: placed as 'DaBanStrategy', reported as '大QMT桥接器').
+        #174 misread that field as "passorder's strategyName coming back".
 
         Orders this bridge submitted are remembered at submit time, keyed by
-        the user_order_id that rides out as the order remark, so those can be
-        named. Orders placed by hand in the terminal have no remark and stay
-        unnamed; there is nothing to recover for them.
+        the user_order_id that rides out as the order remark, and that record
+        is authoritative -- it WINS over the row's field whenever it has a
+        name. Rows without a remark (hand-placed orders) or without an
+        identity record (another process's orders) keep the row's value.
         """
         rows = list(snapshots or [])
-        unnamed = [row for row in rows
-                   if not str(getattr(row, "strategy_name", "") or "").strip()]
-        if not unnamed:
+        candidates = [row for row in rows
+                      if str(getattr(row, "user_order_id", "") or "").strip()]
+        if not candidates:
             return rows
         redis_client = self._identity_redis()
         if redis_client is not None:
@@ -1517,8 +1521,8 @@ class BigQmtRpcHandlers:
 
                 identities = order_identity_map(
                     redis_client, account_id,
-                    [getattr(row, "user_order_id", "") for row in unnamed])
-                for row in unnamed:
+                    [getattr(row, "user_order_id", "") for row in candidates])
+                for row in candidates:
                     identity = identities.get(
                         str(getattr(row, "user_order_id", "") or "").strip())
                     if identity and identity.get("strategy_name"):
@@ -1526,13 +1530,12 @@ class BigQmtRpcHandlers:
             except Exception:
                 pass
         # No-Redis deployments still name what THIS process submitted: the
-        # in-process journal written at submit time (issue #156).
+        # in-process journal written at submit time (issue #156). It runs
+        # after the redis store so this process's own record wins a collision.
         journal = getattr(self, "_order_identity_local", None)
         if journal:
             now = time.time()
-            for row in unnamed:
-                if str(getattr(row, "strategy_name", "") or "").strip():
-                    continue
+            for row in candidates:
                 key = (str(account_id or ""),
                        str(getattr(row, "user_order_id", "") or "").strip())
                 entry = journal.get(key)
