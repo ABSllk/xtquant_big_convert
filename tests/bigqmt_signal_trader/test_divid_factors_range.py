@@ -199,6 +199,66 @@ class PrefersARealRangeWhenOneExistsTest(unittest.TestCase):
         self.assertEqual(context.calls, [], "context should not be touched")
 
 
+class MissingDailyBarsSelfHealTest(unittest.TestCase):
+    """#222: with <2 daily bars the bridge downloads the window itself, then
+    rescans; only a STILL-short scan raises. The reporter's loop had daily
+    bars in their own DuckDB but none on the terminal, so "the library already
+    has them" never helped -- the scan reads the terminal's local bars.
+    """
+
+    def _provider_with_download(self, bars_before, bars_after):
+        provider = _provider(Context({"20260612": {"x": DIVIDEND}}), bars=bars_before)
+        calls = []
+
+        def fake_download(stock_code, period, start_time, end_time):
+            calls.append((stock_code, period, start_time, end_time))
+            # The terminal now has the daily bars.
+            provider.get_market_data_ex = (
+                lambda **kw: {kw["stock_list"][0]: bars_after})
+            return True
+
+        provider.qmt_api = {"download_history_data": fake_download}
+        return provider, calls
+
+    def test_it_downloads_then_rescans_instead_of_raising(self):
+        provider, calls = self._provider_with_download([], BARS)
+
+        answer = provider.get_divid_factors("600036.SH", "20260401", "20260904")
+
+        self.assertEqual(calls, [("600036.SH", "1d", "20260401", "20260904")])
+        self.assertIn("x", answer)   # the event the empty scan would have lost
+
+    def test_still_short_after_the_download_raises_with_the_honest_note(self):
+        provider, calls = self._provider_with_download([], [])
+
+        with self.assertRaises(RuntimeError) as caught:
+            provider.get_divid_factors("600036.SH", "20260401", "20260904")
+
+        self.assertEqual(len(calls), 1)
+        message = " ".join(str(caught.exception).split())
+        self.assertIn("The bridge downloaded the daily window itself", message)
+        self.assertIn("#165", message)
+
+    def test_a_failing_download_keeps_the_original_error(self):
+        provider = _provider(Context(), bars=[])
+        provider.qmt_api = {
+            "download_history_data": lambda *a: (_ for _ in ()).throw(OSError("down"))}
+
+        with self.assertRaises(RuntimeError) as caught:
+            provider.get_divid_factors("600036.SH", "20260401", "20260904")
+
+        self.assertIn("Download the daily history first", str(caught.exception))
+
+    def test_no_download_channel_raises_the_original_error(self):
+        provider = _provider(Context(), bars=[])
+        provider.qmt_api = {}
+
+        with self.assertRaises(RuntimeError) as caught:
+            provider.get_divid_factors("600036.SH", "20260401", "20260904")
+
+        self.assertIn("Download the daily history first", str(caught.exception))
+
+
 class NoDailyBarsMustNotLookEmptyTest(unittest.TestCase):
     """The failure this issue is about, reintroduced in miniature if we let it.
 
