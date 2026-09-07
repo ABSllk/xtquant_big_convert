@@ -3,9 +3,17 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.25] - 2026-09-07
 
 ### 修复
+
+- **期货/期权查询行的买卖方向读错字段**（#217）。`_action_from_offset_flag` 把 `m_nOffsetFlag` 直接当方向（48=买/49=卖）——那是股票事实；期货和 ETF 期权的 offset 是开/平仓，于是**卖出开空**（offset=48 开仓）被报成 BUY、**买入平仓**（offset=49 平仓）被报成 SELL。直通 opType 表（期货 0-15、ETF 期权 50-55，与仓内 API 参考一致）本来就带着方向，现在 FUTURE / STOCK_OPTION 账户的查询行优先从 `m_nOpType` 读方向，无方向的行（56/57 行权）回落 offset；股票路径不动。
+
+- **期货/期权回调方向仲裁同样接入 opType 表**（#218）。回调仲裁器原来只认识股票的 23/24，遇到期货/期权 opType 就落到 offset（开平）——卖出开空被判 BUY。已知局限钉在文档里：成交（deal）行不带 `m_nOpType`，仍只能靠 offset。
+
+- **回调/查询里的 strategy_name 是桥进程名，不是下单传的策略名**（#216，#161/#174 线的延续）。实盘取证：以 `strategy_name='probe216'` 下单，事件和查询都返回 `'BIGQMT_REDIS_DRYRUN'`——QMT 侧策略自己的注册名。#174 把 `m_strSource` 读作「passorder 的 strategyName 原样回来」是错的。现在**下单时写入的身份记录**（调用方真实名字）在事件路径和查询路径都优先于行字段；无身份记录的行（手工单/别的进程的单）保持原样。策略文件有改动，**升级后需重启策略**（reload 刷不到事件路径）。
+
+- **合成周期 + 空 field_list 读回 0 行**（#219）。`get_market_data_ex` 对 1mon/1q/1hy/1y 在 `field_list=[]`（全部列）下有的终端返回 0 行，而显式 OHLCV 有数据；「[] 为全部」在合成周期上的展开因终端/版本而异，不可信赖。现在该场景用官方参考的显式 K 线 11 字段重试一次（重试为空仍为空，显式字段/日线永不重试），raw 路径顺带补上空 columns 的畸形。`qmt.py kline` 默认参数之前会把这条路径的空渲染成「K 线数据为空」，误导成「没有这个周期」。
 
 - **redis 里不再留没用的键**（#213）。实盘统计（休市期间）暴露三件事：
 
