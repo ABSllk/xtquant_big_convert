@@ -1044,6 +1044,10 @@ class BigQmtRpcClient:
         redis_client = self._redis()
         try:
             redis_client.xadd(stream_key, {"payload": raw}, maxlen=1000, approximate=True)
+            # 客户端侧写的流同样要能自己消失（#213）。
+            from .adapters.redis_common import touch_stream_ttl
+
+            touch_stream_ttl(redis_client, stream_key)
         except Exception:
             pass
         try:

@@ -660,12 +660,17 @@ def publish_exec_event(sink, account_id, event):
 
 
 def _publish(redis_client, channel, event, maxlen=2000):
-    from .adapters.redis_common import note_stream_failure, streams_dead
+    from .adapters.redis_common import (
+        note_stream_failure, streams_dead, touch_stream_ttl,
+    )
 
     raw = json.dumps(event, ensure_ascii=False, default=str)
     if not streams_dead():
         try:
             redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
+            # maxlen 只挡单键膨胀，挡不住键永远不消失：换个账号、停用一个部署，
+            # 键就一直留着。续期一次，停写的流自然过期（#213）。
+            touch_stream_ttl(redis_client, channel)
         except Exception as exc:
             # redis < 5.0 has no streams: log once, then skip xadd for good.
             # Anything else stays silent and retried, as before (issue #163).
