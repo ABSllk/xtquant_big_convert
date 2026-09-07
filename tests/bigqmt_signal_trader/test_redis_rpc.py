@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
+from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
 from bigqmt_signal_trader.models import (
     AssetSnapshot,
     CancelResult,
@@ -945,6 +946,50 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["data"]["600000.SH"]["available"], 800)
         self.assertEqual(redis_client.published[0][0], "bigqmt:rpc:resp:acct:req-1")
+
+    def test_native_position_query_failure_becomes_rpc_error(self):
+        def query(account_id, account_type, detail_type):
+            self.assertEqual((account_id, account_type, detail_type),
+                             ("acct", "STOCK", "POSITION"))
+            raise RuntimeError("simulated native POSITION query failure")
+
+        redis_client, service = _service()
+        service.handlers.position_provider = BigQmtPositionProvider(query)
+
+        for method in ("get_positions", "query_stock_positions"):
+            with self.subTest(method=method):
+                service.enqueue_payload({
+                    "request_id": method,
+                    "account_id": "acct",
+                    "method": method,
+                    "params": {},
+                })
+                self.assertEqual(service.drain_pending(), 1)
+                response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:" + method])
+                self.assertFalse(response["ok"])
+                self.assertIsNone(response["data"])
+                self.assertEqual(response["error"],
+                                 "RuntimeError: simulated native POSITION query failure")
+
+    def test_native_empty_positions_remain_successful_rpc_result(self):
+        redis_client, service = _service()
+        provider = BigQmtPositionProvider(lambda *args: [])
+        service.handlers.position_provider = provider
+        self.assertEqual(provider.get_positions("acct"), {})
+
+        for method in ("get_positions", "query_stock_positions"):
+            with self.subTest(method=method):
+                service.enqueue_payload({
+                    "request_id": method,
+                    "account_id": "acct",
+                    "method": method,
+                    "params": {},
+                })
+                self.assertEqual(service.drain_pending(), 1)
+                response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:" + method])
+                self.assertTrue(response["ok"], response["error"])
+                self.assertEqual(response["data"], {})
+                self.assertEqual(response["error"], "")
 
     def test_process_in_listener_handles_request_without_waiting_for_drain(self):
         redis_client, service = _service(process_in_listener=True)

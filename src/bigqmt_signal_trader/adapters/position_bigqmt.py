@@ -156,12 +156,8 @@ class BigQmtPositionProvider:
 
     def get_positions(self, account_id):
         query = self._require_query_func()
-        # QMT's get_trade_detail_data can raise on POSITION queries in some
-        # states (e.g. context not bound). Degrade to empty like get_asset does.
-        try:
-            rows = query(account_id, self._resolve_account_type(account_id), "POSITION") or []
-        except Exception:
-            return {}
+        # Let query failures reach the RPC error handler instead of reporting empty positions.
+        rows = query(account_id, self._resolve_account_type(account_id), "POSITION") or []
         positions = {}
         for row in rows:
             try:
