@@ -919,6 +919,26 @@ class BigQmtMarketDataProvider:
             return None
         return func(stock_code, start_time, end_time)
 
+    def _download_daily_window(self, stock_code, start_time, end_time):
+        """One terminal-side daily-bars download for a window that scanned
+        empty (#222).
+
+        Uses the terminal's own downloader (the injected
+        ``download_history_data`` / ``down_history_data`` global), never the
+        embedded xtdata SDK -- that one has no reachable data service in the
+        full terminal. True when a downloader answered; False when there is no
+        channel or it raised -- the caller keeps the original honest error.
+        """
+        download = (self.qmt_api.get("download_history_data")
+                    or self.qmt_api.get("down_history_data"))
+        if not callable(download):
+            return False
+        try:
+            download(stock_code, "1d", start_time, end_time)
+        except Exception:
+            return False
+        return True
+
     def _divid_candidate_days(self, stock_code, start_time, end_time):
         """Days in the window that look like ex-dividend days.
 
@@ -958,22 +978,46 @@ class BigQmtMarketDataProvider:
         tell, and saying so is the only honest answer.
         """
         self._divid_scan_rows = 0
+        # Set before the scan so the error can say what was tried (#222).
+        self._divid_download_note = (
+            ". Download the daily history first (download_history_data), or "
+            "ask one date at a time")
         try:
             candidates = self._divid_candidate_days(stock_code, start_time, end_time)
         except Exception:
             candidates = []
+        if self._divid_scan_rows < 2 and self._download_daily_window(
+                stock_code, start_time, end_time):
+            # #222: the bridge knows what is missing, so it fetches it rather
+            # than telling the caller to. The downloader may answer before the
+            # bars are actually local, so rescan a few times on a short leash
+            # before concluding anything.
+            self._divid_download_note = (
+                ". The bridge downloaded the daily window itself "
+                "(download_history_data) and the terminal still returned %d "
+                "daily bar(s)" )
+            for _attempt in range(3):
+                try:
+                    candidates = self._divid_candidate_days(
+                        stock_code, start_time, end_time)
+                except Exception:
+                    candidates = []
+                if self._divid_scan_rows >= 2:
+                    break
+                time.sleep(1.0)
+            self._divid_download_note %= self._divid_scan_rows
         if self._divid_scan_rows < 2:
             raise RuntimeError(
                 "get_divid_factors(%r, %s, %s) cannot answer a range here: big "
                 "QMT's ContextInfo takes only (code, single date), so the range "
                 "is expanded by scanning daily bars for ex-dividend days -- and "
                 "this terminal returned %d daily bar(s) for that window, too "
-                "few to compare even one preClose against the previous close. "
-                "Download "
-                "the daily history first (download_history_data), or ask one "
-                "date at a time. Returning {} would have been indistinguishable "
-                "from 'no dividends in this range' (issue #165)."
-                % (stock_code, start_time, end_time, self._divid_scan_rows))
+                "few to compare even one preClose against the previous close"
+                "%s. Returning {} would have been indistinguishable from 'no "
+                "dividends in this range' (issue #165)."
+                % (stock_code, start_time, end_time, self._divid_scan_rows,
+                   self._divid_download_note))
+        merged = {}
         merged = {}
         for day in candidates[:self._DIVID_MAX_PROBES]:
             try:
