@@ -193,6 +193,7 @@ class CallbackContractTest(unittest.TestCase):
         client = _CancelFakeClient(cancel_exc=RuntimeError("boom"))
         trader = self._trader(cb, client)
         trader.cancel_order_stock_async("acct", "sys-9")
+        trader.wait_async_orders(timeout=5.0)
         self.assertEqual(len(cb.cancel_errors), 1)
         self.assertEqual(str(cb.cancel_errors[0].order_id), "sys-9")
 
@@ -201,6 +202,7 @@ class CallbackContractTest(unittest.TestCase):
         client = _CancelFakeClient(cancel_result={"success": True})
         trader = self._trader(cb, client)
         trader.cancel_order_stock_async("acct", "sys-9")
+        trader.wait_async_orders(timeout=5.0)
         self.assertEqual(len(cb.cancel_responses), 1)
         resp = cb.cancel_responses[0]
         self.assertEqual(resp.cancel_result, 0)
@@ -212,6 +214,7 @@ class CallbackContractTest(unittest.TestCase):
         client = _CancelFakeClient(cancel_result={"success": False})
         trader = self._trader(cb, client)
         trader.cancel_order_stock_async("acct", "sys-9")
+        trader.wait_async_orders(timeout=5.0)
         self.assertEqual(len(cb.cancel_responses), 1)
         resp = cb.cancel_responses[0]
         self.assertNotEqual(resp.cancel_result, 0)

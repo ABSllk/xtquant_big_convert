@@ -820,18 +820,16 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
 
     def test_cancel_order_stock_async_fires_response(self):
         trader, cb = self._trader()
-        original = trader.cancel_order_stock_sysid
+        trader.client.account_id = "acct"
 
-        def fake_cancel(account, market, sysid):
-            return 0        # MiniQMT: 0 == success (issue #113)
+        def fake_call(method, params=None, account_id=None, timeout_seconds=None):
+            return {"success": True}
 
-        trader.cancel_order_stock_sysid = fake_cancel
-        try:
-            seq = trader.cancel_order_stock_sysid_async("acct", "SH", "sys-1")
-        finally:
-            trader.cancel_order_stock_sysid = original
+        trader.client.call = fake_call
+        seq = trader.cancel_order_stock_sysid_async("acct", "SH", "sys-1")
 
         self.assertGreater(seq, 0)
+        self.assertTrue(trader.wait_async_orders(timeout=5.0))
         self.assertEqual(len(cb.cancel_async_responses), 1)
         resp = cb.cancel_async_responses[0]
         self.assertTrue(resp.success)
