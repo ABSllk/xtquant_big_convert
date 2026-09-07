@@ -63,6 +63,17 @@ OFFSET_CLOSE_YESTERDAY = 52
 _BUY_DIRECTIONS = {ENTRUST_BUY, str(ENTRUST_BUY), OFFSET_OPEN, str(OFFSET_OPEN), 23, "23", "BUY", "buy", "B"}
 _SELL_DIRECTIONS = {ENTRUST_SELL, str(ENTRUST_SELL), OFFSET_CLOSE, str(OFFSET_CLOSE), OFFSET_CLOSE_TODAY, str(OFFSET_CLOSE_TODAY), OFFSET_CLOSE_YESTERDAY, str(OFFSET_CLOSE_YESTERDAY), 24, "24", "SELL", "sell", "S"}
 
+# Futures (0-15) / ETF option (50-55) opTypes never appear in _BUY/_SELL_DIRECTIONS
+# (those hold the stock opTypes 23/24 and the direction/offset enums 48/49/51/52).
+# A futures sell-to-open row arrives as direction=49 + offset=48(开仓) + op_type=3(开空):
+# without these sets the arbiter cannot decide and falls back to offset=48, which
+# reads as BUY. Sides mirror adapters.order_bigqmt._FUTURE_BUY_SIDE and friends
+# (kept local here because order_bigqmt imports from this module).
+_FUTURES_OP_BUY = frozenset({0, 4, 5, 8, 9, 12, 13, 14})
+_FUTURES_OP_SELL = frozenset({1, 2, 3, 6, 7, 10, 11, 15})
+_ETF_OPTION_OP_BUY = frozenset({50, 53, 55})
+_ETF_OPTION_OP_SELL = frozenset({51, 52, 54})
+
 
 def order_channel(account_id):
     return ORDER_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
@@ -204,6 +215,14 @@ def _conflict_resolve(d_val, o_val, obj):
       - Futures sell+open: direction=49(sell), offset=48(open), op_type=24(sell) → sell
       - Futures buy+close: direction=48(buy), offset=49(close), op_type=23(buy) → buy
 
+    Some terminals report futures callbacks with the stock opType domain
+    (23/24, as above); others report the futures/ETF-option opType table
+    (futures 0-15, ETF options 50-55), which _BUY/_SELL_DIRECTIONS do not
+    hold. Those opTypes arbitrate through _FUTURES_OP_BUY/_SELL and
+    _ETF_OPTION_OP_BUY/_SELL instead -- without them the arbiter falls back
+    to offset, and offset is open/close on those accounts, so a futures
+    sell-to-open (offset=48) resolved as BUY.
+
     Returns a resolved value, or None if no arbiter can decide.
     """
     op = _attr(obj, ["m_nOpType", "op_type", "order_type"])
@@ -213,6 +232,12 @@ def _conflict_resolve(d_val, o_val, obj):
             if op_int in _BUY_DIRECTIONS:
                 return d_val if _is_buy(d_val) else o_val if _is_buy(o_val) else op
             if op_int in _SELL_DIRECTIONS:
+                return d_val if _is_sell(d_val) else o_val if _is_sell(o_val) else op
+            # Futures (0-15) / ETF option (50-55) opTypes: m_nDirection reliably
+            # reflects the side for futures (48=买, 49=卖), so prefer d_val.
+            if op_int in _FUTURES_OP_BUY or op_int in _ETF_OPTION_OP_BUY:
+                return d_val if _is_buy(d_val) else o_val if _is_buy(o_val) else op
+            if op_int in _FUTURES_OP_SELL or op_int in _ETF_OPTION_OP_SELL:
                 return d_val if _is_sell(d_val) else o_val if _is_sell(o_val) else op
         except (TypeError, ValueError):
             if op in _BUY_DIRECTIONS:
