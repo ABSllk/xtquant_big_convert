@@ -115,6 +115,7 @@ ORDER_METHODS = {
     "submit_order",
     "submit_orders_batch",
     "cancel_order",
+    "cancel_orders_batch",
     # Raw native-passorder passthrough (route 2). Gated behind
     # allow_order_methods like every other write, and deferred to the adjust
     # thread by virtue of not being in READ_METHODS.
@@ -208,6 +209,7 @@ METHOD_ALIASES = {
     "order_stock_batch": "submit_orders_batch",
     "cancel_order_stock": "cancel_order",
     "cancel_order_stock_sysid": "cancel_order",
+    "cancel_order_stock_batch": "cancel_orders_batch",
 }
 
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
@@ -2675,6 +2677,49 @@ class BigQmtRpcHandlers:
         else:
             self._pending_settlement = settlement
         return result
+
+    def _handle_cancel_orders_batch(self, params):
+        """Cancel N orders in one RPC.
+
+        Settlement lookups are skipped (same reason as submit_orders_batch:
+        get_trade_detail_data is empty off the adjust thread). The cancel
+        callback on the client confirms the outcome asynchronously.
+        """
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        items = params.get("items") or []
+        if not isinstance(items, list) or not items:
+            raise ValueError("items must be a non-empty list")
+        if len(items) > 500:
+            raise ValueError("items exceeds batch limit 500")
+        results = []
+        for index, item in enumerate(items):
+            item = dict(item or {})
+            account_id = item.get("account_id") or self._request_account_id(params)
+            order_sys_id = str(
+                item.get("order_sysid")
+                or item.get("order_sys_id")
+                or item.get("order_id")
+                or ""
+            )
+            market = str(item.get("market") or "")
+            entry = {"index": index, "success": False}
+            if not order_sys_id:
+                entry["error"] = "order_sysid is required"
+                results.append(entry)
+                continue
+            order_ref = OrderRef(
+                order_sys_id=order_sys_id,
+                user_order_id=str(item.get("user_order_id") or ""),
+            )
+            try:
+                result = self.order_gateway.cancel(order_ref, account_id=account_id)
+                entry["success"] = bool(getattr(result, "success", result))
+                entry["message"] = str(getattr(result, "message", "") or "")
+            except Exception as exc:
+                entry["error"] = "%s: %s" % (type(exc).__name__, exc)
+            results.append(entry)
+        return results
 
     def _settle_cancel_from_status(self, settlement, status, order_sys_id, final):
         """One status answer, from the watch table or the snapshot row."""
