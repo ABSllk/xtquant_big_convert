@@ -3908,7 +3908,14 @@ class BigQmtXtTrader:
         })
 
     def _submit_async_cancel_batch(self, account_id, group):
-        """N cancels in one RPC; one callback per item."""
+        """N cancels in one RPC; one callback per item.
+
+        Failure taxonomy mirrors the order batch (#195): a batch the server
+        REFUSED (answered with an error -- the handler raises before its
+        per-item loop, so nothing ran) or answered empty is safe to retry as
+        singles; a timeout/transport failure means the cancels may be running
+        and retrying would double-cancel -- report unknown-outcome per item
+        instead."""
         payload = []
         for seq, args, kwargs in group:
             order_id = args[1] if len(args) > 1 else kwargs.get("order_id", "")
@@ -3924,17 +3931,42 @@ class BigQmtXtTrader:
                 {"account_id": account_id, "items": payload},
                 account_id=account_id,
             ) or []
+        except RpcServerRepliedError as exc:
+            log.warning("cancel batch of %d refused by the server (%s); "
+                        "submitting one at a time", len(group), exc)
+            for job in group:
+                try:
+                    self._submit_async_cancel_single(job)
+                except Exception:
+                    log.exception("async cancel failed after batch refusal")
+            return
         except Exception as exc:
+            log.exception("cancel batch of %d outcome unknown; NOT resubmitting",
+                          len(group))
             for seq, args, kwargs in group:
                 order_id = args[1] if len(args) > 1 else kwargs.get("order_id", "")
                 market = args[2] if len(args) > 2 else kwargs.get("market", "")
                 self._enqueue_async_outcome({
                     "kind": "cancel_error", "seq": seq,
                     "order_id": order_id, "market": market,
-                    "error_id": -1,
-                    "error_msg": "cancel batch failed: %s: %s"
-                                 % (exc.__class__.__name__, exc),
+                    "error_id": -4,
+                    "error_msg": ("cancel batch outcome unknown (%s: %s); the "
+                                  "cancels MAY BE RUNNING -- check the order "
+                                  "status before retrying"
+                                  % (exc.__class__.__name__, exc)),
                 })
+            return
+        if not results:
+            # The server appends one result per item, so nothing back means the
+            # batch never ran -- not that every cancel failed. Fall back to
+            # singles, which is what would have happened anyway.
+            log.warning("cancel batch of %d returned no results; submitting "
+                        "one at a time", len(group))
+            for job in group:
+                try:
+                    self._submit_async_cancel_single(job)
+                except Exception:
+                    log.exception("async cancel failed after empty batch")
             return
         by_index = {}
         for position, entry in enumerate(results):
@@ -4391,6 +4423,10 @@ class BigQmtXtTrader:
                         CompatObject(
                             error_id=unit["error_id"],
                             error_msg=unit["error_msg"],
+                            # seq was missing here while the response path had
+                            # it -- an uncorrelatable error is how "which
+                            # cancel failed?" goes unanswered.
+                            seq=seq,
                             order_sysid=str(order_id or ""),
                             order_sys_id=str(order_id or ""),
                             order_id=self._order_object_id(order_id),
@@ -4405,7 +4441,16 @@ class BigQmtXtTrader:
                         seq=seq,
                         success=bool(ok),
                         cancel_result=0 if ok else -1,
-                        error_msg="" if ok else "cancel_order_stock rejected by server",
+                        # The native cancel return answers "the request went
+                        # out", not "the order is cancelled" -- it has been
+                        # false while the cancel landed (#148) and true for a
+                        # nonexistent order (#151). Never word it as a
+                        # rejection; the order-status push (54) or a query is
+                        # the confirmation.
+                        error_msg="" if ok else (
+                            "cancel not confirmed by the counter; the order may "
+                            "still get cancelled -- check the order-status push "
+                            "or query before assuming either way"),
                         order_sysid=str(order_id or ""),
                         order_sys_id=str(order_id or ""),
                         order_id=self._order_object_id(order_id),

@@ -3,6 +3,16 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 新增
+
+- **异步撤单与批量撤单**（#224，贡献者 @shihaibi）：`cancel_order_stock_async` / `cancel_order_stock_sysid_async` 从内联阻塞改为队列异步（复用异步下单的 worker + 回调分发线程），积压按账户分组成一次 `cancel_order_stock_batch` RPC（单项上限 500，超时随 N 缩放）。`cancel_order_stock_batch(account, cancels)` 同步批量接口同批新增，每项应答带 `accepted`/`confirmed`。**行为变化**：`cancel_order_stock_async` 的回调不再在返回前内联触发，改为回调线程异步到达。
+
+### 修复
+
+- **批量撤单应答不再复述原生返回值当结论**（#224 跟修）：原生 cancel 返回值两个方向都会说谎（#148 假失败 / #151 假成功），批量逐项应答现在区分 `accepted`（网关已受理）与 `confirmed`（恒 False——此路径不读回确认，撤单确认看委托状态推送 54 或查询）；失败文案不再写「rejected」，改为明说「未被确认，单子可能仍会撤掉，以状态推送/查询为准」。批量超时/断连不重提（#195 的撤单侧镜像）；服务端明确拒绝或返回空才回退逐笔。`on_cancel_error` 回调补上 `seq`（此前无法关联是哪笔）。
+
 ## [0.3.26] - 2026-09-07
 
 ### 修复

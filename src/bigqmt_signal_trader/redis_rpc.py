@@ -2703,7 +2703,17 @@ class BigQmtRpcHandlers:
                 or ""
             )
             market = str(item.get("market") or "")
-            entry = {"index": index, "success": False}
+            # accepted/confirmed mirror the submit batch's vocabulary: the
+            # native cancel return answers "the request went out", not "the
+            # order is cancelled" -- and it lies in BOTH directions live
+            # (#148: false while the order was cancelled 67ms later; #151:
+            # true for an order that did not exist). The single-cancel path
+            # settles against the order snapshot; this batch path skips that
+            # (it is the latency the batch exists to avoid), so nothing here
+            # may claim "cancelled". The confirmation is the order-status push
+            # (54) or a query read-back.
+            entry = {"index": index, "success": False,
+                     "accepted": False, "confirmed": False}
             if not order_sys_id:
                 entry["error"] = "order_sysid is required"
                 results.append(entry)
@@ -2715,6 +2725,7 @@ class BigQmtRpcHandlers:
             try:
                 result = self.order_gateway.cancel(order_ref, account_id=account_id)
                 entry["success"] = bool(getattr(result, "success", result))
+                entry["accepted"] = True
                 entry["message"] = str(getattr(result, "message", "") or "")
             except Exception as exc:
                 entry["error"] = "%s: %s" % (type(exc).__name__, exc)
