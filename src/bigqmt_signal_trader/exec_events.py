@@ -564,7 +564,14 @@ def enrich_order_identity(redis_client, account_id, event):
         identity = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
     except Exception:
         return event
-    if not event.get("strategy_name") and identity.get("strategy_name"):
+    if identity.get("strategy_name"):
+        # The row's strategy-name field carries the QMT-side strategy's
+        # registered name (the bridge process, e.g. BIGQMT_REDIS_DRYRUN), not
+        # the strategy_name the caller passed at order time (#216: an order
+        # placed with strategy_name='DaBanStrategy' reported back
+        # '大QMT桥接器'). The identity was written at submit time from the
+        # caller's own value, so it wins whenever it has a name. Rows with no
+        # identity record (hand orders, other processes) keep the row's value.
         event["strategy_name"] = str(identity.get("strategy_name") or "")
     if not event.get("stock_code") and identity.get("stock_code"):
         event["stock_code"] = str(identity.get("stock_code") or "")

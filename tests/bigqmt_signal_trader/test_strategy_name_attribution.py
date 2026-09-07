@@ -281,16 +281,29 @@ class AttributionTest(unittest.TestCase):
 
         self.assertEqual(named[0].strategy_name, "")
 
-    def test_a_row_that_already_has_a_name_is_left_alone(self):
-        rows = [Row(user_order_id="bq:abc:sig-1", strategy_name="beta")]
+    def test_the_submit_time_identity_wins_over_the_rows_name(self):
+        """#216: the row's strategy-name field carries the QMT-side strategy's
+        registered name (the bridge process, e.g. '大QMT桥接器'), not the
+        caller's strategy_name. The submit-time identity record is the
+        authoritative one and must WIN over the row's value."""
+        rows = [Row(user_order_id="bq:abc:sig-1", strategy_name="大QMT桥接器")]
+
+        named = self._handlers(self.redis)._attribute_to_strategies(ACCOUNT, rows)
+
+        self.assertEqual(named[0].strategy_name, "alpha")
+
+    def test_an_unknown_remark_keeps_the_rows_name(self):
+        """An order this bridge never submitted (no identity record) keeps
+        whatever the row says -- overriding only on a hit."""
+        rows = [Row(user_order_id="someone-elses", strategy_name="beta")]
 
         named = self._handlers(self.redis)._attribute_to_strategies(ACCOUNT, rows)
 
         self.assertEqual(named[0].strategy_name, "beta")
-        self.assertEqual(self.redis.mgets, [])
 
-    def test_all_rows_named_means_no_redis_traffic(self):
-        rows = [Row(user_order_id="bq:abc:sig-1", strategy_name="beta")]
+    def test_rows_without_remarks_mean_no_redis_traffic(self):
+        """Only remarked rows can have an identity; blank ones never ask."""
+        rows = [Row(user_order_id="", strategy_name="beta")]
 
         self._handlers(self.redis)._attribute_to_strategies(ACCOUNT, rows)
 
