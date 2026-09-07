@@ -439,24 +439,57 @@ class MethodRegistrationTest(unittest.TestCase):
 class CreditCallbackWiringTest(unittest.TestCase):
     """QMT 只往被挂载的那个文件回调，所以每个入口文件都要再导出一次。"""
 
+    # 仓库里跟踪着的入口文件。
     ENTRY_FILES = (
         "src/BIGQMT_REDIS_DRYRUN.py",
         "src/BIGQMT_ZMQ_BACKTEST.py",
-        "src/BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py",
         "src/bigqmt_signal_trader_redis_rpc_runtime.py",
         "src/bigqmt_signal_trader_redis_dryrun.py",
         "src/bigqmt_signal_trader_dryrun.py",
         "bigqmt_no_redis/DRYRUN_no_redis.py",
     )
 
-    def test_every_entry_that_exports_deal_callback_exports_the_credit_one(self):
+    # 单文件构建产物是 .gitignore 掉的生成物，干净检出里根本不存在，
+    # 直接读它会让整条用例以 FileNotFoundError 挂掉。产物里那段导出是
+    # 构建脚本里的纯文本模板（只有被嵌入的模块源码是 base64），而构建
+    # 脚本是跟踪着的——所以事实来源是它们，不是产物。
+    GENERATED_ENTRIES = (
+        ("tools/build_single_file.py",
+         "src/BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py"),
+        ("tools/build_no_redis_single_file_flat.py",
+         "src/BIGQMT_DRYRUN_NO_REDIS_FLAT_ALL_IN_ONE.py"),
+    )
+
+    def _missing_credit_export(self, rel):
+        """rel 导出了 deal_callback 却没导出 credit_account_callback 就算漏。"""
         import io
-        missing = []
+        path = os.path.join(ROOT, rel.replace("/", os.sep))
+        text = io.open(path, encoding="utf-8", errors="replace").read()
+        return "deal_callback" in text and "credit_account_callback" not in text
+
+    def _assert_present(self, rel):
+        """文件不在了要响亮地挂，否则这条检查会静默地变成空跑。"""
+        path = os.path.join(ROOT, rel.replace("/", os.sep))
+        self.assertTrue(os.path.exists(path),
+                        "名单里的文件不在了，名单该跟着改：%s" % rel)
+
+    def test_every_entry_that_exports_deal_callback_exports_the_credit_one(self):
         for rel in self.ENTRY_FILES:
-            path = os.path.join(ROOT, rel.replace("/", os.sep))
-            text = io.open(path, encoding="utf-8", errors="replace").read()
-            if "deal_callback" in text and "credit_account_callback" not in text:
-                missing.append(rel)
+            self._assert_present(rel)
+        missing = [rel for rel in self.ENTRY_FILES
+                   if self._missing_credit_export(rel)]
+        self.assertEqual(missing, [])
+
+    def test_single_file_builders_export_the_credit_callback(self):
+        """产物没生成时查构建脚本；本地生成过就顺手把产物也查了。"""
+        missing = []
+        for builder, generated in self.GENERATED_ENTRIES:
+            self._assert_present(builder)
+            if self._missing_credit_export(builder):
+                missing.append(builder)
+            out = os.path.join(ROOT, generated.replace("/", os.sep))
+            if os.path.exists(out) and self._missing_credit_export(generated):
+                missing.append(generated)
         self.assertEqual(missing, [])
 
     def test_strategy_defines_the_callback_and_binds_the_global(self):
