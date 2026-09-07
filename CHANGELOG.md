@@ -3,6 +3,12 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.26] - 2026-09-07
+
+### 修复
+
+- **区间除权因子在终端缺日线时先自救再报错**（#222，#165 后续）。`get_divid_factors(code, start, end)` 的区间展开要扫终端本地日线找昨收跳变，终端窗口内日线不足 2 根时此前直接 `RuntimeError("Download the daily history first")`——把自救推给调用方；而调用方自己的库里日线往往是齐的，增量下载因此跳过、终端永远没数。现在桥在扫描不足时自己调终端的下载器（注入的 `download_history_data` / `down_history_data`，不走大 QMT 里没有可达数据服务的内嵌 xtdata SDK）补一截日线，短缰绳重扫后仍不足才抛。#165 的底线不动：不许静默空 dict。报错文案区分「没有下载通道」和「下过但仍缺」两种成因。维护者终端实测下载 0.3s 应答、数据立即可读。
+
 ## [0.3.25] - 2026-09-07
 
 ### 修复
