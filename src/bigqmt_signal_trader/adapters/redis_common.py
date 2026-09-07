@@ -79,6 +79,32 @@ def redis_mapping_to_text(mapping):
 # are often 3.0.x) answer with "unknown command 'XADD'". Learn it once from the
 # failure, say it once, and let callers skip xadd from then on -- pub/sub keeps
 # working on those servers (issue #163).
+# 事件流的滑动过期时间。
+#
+# maxlen 只挡住单个键的无限增长，挡不住**键本身永远不消失**：换个账号、停用一个
+# 部署、跑一次探测，键就永远留在 redis 里。实测线上七个事件流全是永久键
+# （position_events 843KB、order_events 1.41MB…）。
+#
+# 所以每次 xadd 之后顺手续一次期：还在写的流一直续上，停了的自然消失。一天足够
+# 覆盖「昨天收盘到今天开盘」的回放需求，又不会让废弃账号的键长期占着（#213）。
+EVENT_STREAM_TTL_SECONDS = 86400
+
+
+def touch_stream_ttl(redis_client, key, ttl_seconds=EVENT_STREAM_TTL_SECONDS):
+    """给事件流续期。失败不能影响写入本身 —— 这是清理，不是主路径。"""
+    try:
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return False
+    if ttl <= 0:
+        return False
+    try:
+        redis_client.expire(key, ttl)
+        return True
+    except Exception:
+        return False
+
+
 _STREAMS_DEAD = False
 
 

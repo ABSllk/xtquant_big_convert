@@ -112,4 +112,12 @@ def push_trade_signal(redis_client, payload, account_id=None, stream_key_templat
     if not account_id:
         raise ValueError("account_id is required")
     stream_key = stream_key_template.format(account_id=account_id)
-    return redis_client.xadd(stream_key, {"payload": json.dumps(raw_payload, ensure_ascii=False, default=_json_default)})
+    entry_id = redis_client.xadd(
+        stream_key,
+        {"payload": json.dumps(raw_payload, ensure_ascii=False, default=_json_default)},
+    )
+    # 信号流同样是永久键。续期一次，停用的账号自然消失（#213）。
+    from .redis_common import touch_stream_ttl
+
+    touch_stream_ttl(redis_client, stream_key)
+    return entry_id
