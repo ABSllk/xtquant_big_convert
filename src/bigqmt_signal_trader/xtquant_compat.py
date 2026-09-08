@@ -2439,6 +2439,24 @@ class BigQmtXtData:
             return ZmqQuotePushChannel(connect_address=address)
         return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
 
+    def quote_subscription_status(self):
+        """What whole-quote combos the bridge thinks are alive, and how stale.
+
+        The diagnostic for "something keeps pushing and I lost the seq": a
+        combo staying fresh has a LIVE keepalive feeding it (a leftover client
+        process); one going silent past the heartbeat timeout is about to be
+        reaped by the server (measured live: ~30s after the client dies).
+        """
+        return self.client.call("quote_subscription_status", {})
+
+    def quote_unsubscribe_all(self):
+        """Kill every whole-quote subscription on the bridge, no seq needed.
+
+        keepalive is a no-op on unknown sub_ids, so a force-cleared combo
+        stays down until someone subscribes again.
+        """
+        return self.client.call("quote_unsubscribe_all", {})
+
     def subscribe_whole_quote(self, code_list, callback=None):
         session = self._whole_quote_session()
         session.start()

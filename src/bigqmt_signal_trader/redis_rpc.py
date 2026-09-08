@@ -100,6 +100,7 @@ READ_METHODS = {
     "get_last_order_id",
     "get_ipo_data",
     "get_new_purchase_limit",
+    "quote_subscription_status",
     "get_history_trade_detail_data",
     "get_assure_contract",
     "get_enable_short_contract",
@@ -129,6 +130,7 @@ QUOTE_SUBSCRIPTION_METHODS = {
     "subscribe_whole_quote",
     "unsubscribe_whole_quote",
     "quote_keepalive",
+    "quote_unsubscribe_all",
 }
 
 LISTENER_DEFERRED_METHODS = {
@@ -1316,6 +1318,25 @@ class BigQmtRpcHandlers:
         client_id, sub_id, _codes = self._quote_params(params)
         manager.keepalive(client_id, sub_id)
         return {}
+
+    def _handle_quote_subscription_status(self, params):
+        """Read-only: what is subscribed, by how many clients, and how stale.
+
+        The answer to "I lost my seq and something is still pushing": a combo
+        that stays fresh has a LIVE keepalive feeding it (a leftover client
+        process, not a leak); one going silent past the heartbeat timeout is
+        about to be reaped.
+        """
+        return self._require_quote_manager().status()
+
+    def _handle_quote_unsubscribe_all(self, params):
+        """Operator kill switch: tear every combo down without needing a seq.
+
+        keepalive is a no-op on unknown sub_ids, so a force-cleared combo
+        stays down until someone subscribes again.
+        """
+        manager = self._require_quote_manager()
+        return {"unsubscribed": manager.unsubscribe_all()}
 
     def _identity_redis(self):
         """Redis for the order-identity store, or None.
