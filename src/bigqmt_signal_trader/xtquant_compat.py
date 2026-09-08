@@ -955,6 +955,9 @@ class BigQmtRpcClient:
             factory_config = {
                 "zmq": zmq_config,
                 "mysql": dict(config_redis.get("mysql") or {}, **self.mysql_config),
+                # 管道名两侧必须一致，否则客户端连的是另一条线 —— 表现为
+                # 「连不上」而不是「配错了」，最难查的那种。
+                "pipe": dict(config_redis.get("pipe") or {}),
             }
             self._transport_instance = build_transport(
                 self.transport_name,

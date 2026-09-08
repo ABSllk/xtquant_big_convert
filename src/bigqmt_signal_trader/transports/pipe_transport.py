@@ -293,6 +293,18 @@ class NamedPipeTransport(RpcTransport):
         finally:
             self._close_server_handle(handle)
 
+    def drain_request_queue(self, max_items=20):
+        """没有队列要排空 —— 请求由每连接的工作线程直接投递。
+
+        **必须存在，哪怕是空实现。** 服务端 drain_request_queue 的兜底分支是
+        Redis 的 ``listen_redis.lpop``，而 pipe 部署上 listen_redis 是 None：
+        传输少了这个方法，adjust 每个 tick 都会撞
+        ``AttributeError: 'NoneType' object has no attribute 'lpop'``。
+        实盘上就是这么炸的 —— 单测抓不到，只有端到端能暴露。zmq 的
+        drain_request_queue 在 router 线程存在时同样是 no-op。
+        """
+        return 0
+
     def send_response(self, request, response):
         handle = (request or {}).get("_pipe_handle")
         if handle is None:

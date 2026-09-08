@@ -80,6 +80,33 @@ class PipePathTest(unittest.TestCase):
         self.assertTrue(pipe_path("bigqmt_rpc", "").endswith("bigqmt_rpc"))
 
 
+class ServiceContractTest(unittest.TestCase):
+    """传输要能被服务端那套 drain/inline 机制驱动，不只是自己能收发。"""
+
+    def test_it_has_drain_request_queue(self):
+        """少了这个方法，adjust 每个 tick 都会撞 Redis 兜底分支。
+
+        服务端 drain_request_queue 的兜底是 listen_redis.lpop，而 pipe 部署上
+        listen_redis 是 None —— 实盘上每 100ms 抛一次
+        AttributeError: 'NoneType' object has no attribute 'lpop'。
+        单测抓不到，只有端到端能暴露，所以这条要钉住。
+        """
+        transport = build_transport("pipe", {}, account_id="acct")
+        self.assertTrue(callable(getattr(transport, "drain_request_queue", None)))
+        self.assertEqual(transport.drain_request_queue(max_items=20), 0)
+
+    def test_every_transport_the_factory_builds_can_be_drained(self):
+        """同一个坑不要在下一个传输上重犯。"""
+        for name in ("redis", "zmq", "pipe"):
+            try:
+                transport = build_transport(name, {}, account_id="acct")
+            except Exception:
+                continue          # 缺依赖的传输跳过，不是本条要测的
+            self.assertTrue(
+                callable(getattr(transport, "drain_request_queue", None)),
+                "%s 传输没有 drain_request_queue，adjust 会掉进 redis 兜底" % name)
+
+
 class FactoryTest(unittest.TestCase):
 
     def test_pipe_is_a_known_transport(self):
