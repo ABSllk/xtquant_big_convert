@@ -60,6 +60,7 @@ ERROR_MORE_DATA = 234
 ERROR_OPERATION_ABORTED = 995
 ERROR_INVALID_HANDLE = 6
 ERROR_BROKEN_PIPE = 109
+ERROR_FILE_NOT_FOUND = 2
 
 _BUFFER_BYTES = 1 << 20      # 1MB: whole-market quote frames are large
 _CONNECT_POLL_SECONDS = 0.05
@@ -115,6 +116,14 @@ class NamedPipeTransport(RpcTransport):
         # DEALER, and the reason that fix is not worth repeating here.
         self._client_local = threading.local()
         self._client_handles = []
+        # One lock per server-side connection: inline answers are written from
+        # the connection's worker thread while deferred answers (orders,
+        # positions, anything in LISTENER_DEFERRED_METHODS) are written from
+        # the adjust thread. Two threads writing one message-mode handle at
+        # once interleave frames and the client sees garbage -- the live
+        # "deferred methods never get a response" defect. Message mode does
+        # NOT make cross-thread writes atomic.
+        self._write_locks = {}
         # 读缓冲也按线程持有 —— 见 _read_buffer 里的实测数字。
         self._io_local = threading.local()
 
@@ -190,7 +199,11 @@ class NamedPipeTransport(RpcTransport):
             if handle != INVALID_HANDLE_VALUE:
                 break
             err = self._last_error()
-            if err != ERROR_PIPE_BUSY or time.time() >= deadline:
+            # FILE_NOT_FOUND is the startup race: start_receiving has spawned
+            # the accept thread but it has not created the first instance yet.
+            # Retrying it is exactly as legitimate as retrying PIPE_BUSY.
+            if err not in (ERROR_PIPE_BUSY, ERROR_FILE_NOT_FOUND) \
+                    or time.time() >= deadline:
                 raise TransportError(
                     "cannot connect to %s (err=%s). Is the QMT-side strategy "
                     "running with transport=pipe?" % (self.path, err))
@@ -202,27 +215,60 @@ class NamedPipeTransport(RpcTransport):
             self._client_handles.append(handle)
         return handle
 
-    def send_request(self, request, timeout_seconds):
-        handle = self._client_handle()
-        payload = json.dumps(request, ensure_ascii=False, default=str).encode("utf-8")
-        started = time.time()
+    def _cancel_read(self, handle):
+        """Abort whatever ReadFile is pending on the handle -- the timeout
+        mechanism for the client (#236 defect 3).
+
+        The first design put a pump thread between the caller and the pipe so
+        the caller could wait on a queue instead. That dead-locked on the very
+        first request: a synchronous (non-overlapped) handle serializes I/O,
+        so a WriteFile issued while the pump sat in a blocking ReadFile on the
+        SAME handle never completes. The alternatives were overlapped I/O or a
+        second pipe per direction; a watchdog that cancels the blocking read
+        at the deadline keeps single-threaded I/O and gets the same real
+        timeout with none of that surgery. CancelIoEx is already the proven
+        shutdown mechanism on the server side (the stop() deadlock fix).
+        """
         try:
-            self._write(handle, payload)
+            self._dll().CancelIoEx(handle, None)
+        except Exception:
+            pass
+
+    def send_request(self, request, timeout_seconds):
+        payload = json.dumps(request, ensure_ascii=False, default=str).encode("utf-8")
+        try:
+            self._write(self._client_handle(), payload)
+        except TransportError:
+            # A write-side failure is provable: nothing left this process, so
+            # ONE reconnect-and-resend is safe (never a duplicate). A read-side
+            # failure is the unknown-outcome case and is NOT retried here --
+            # that is the #195 class of bug. The caller decides on those.
+            self._drop_client_handle()
+            self._write(self._client_handle(), payload)
+        return json.loads(decode_text(
+            self._read_with_watchdog(self._client_handle(), timeout_seconds)))
+
+    def _read_with_watchdog(self, handle, timeout_seconds):
+        watchdog = None
+        if timeout_seconds:
+            watchdog = threading.Timer(
+                float(timeout_seconds), self._cancel_read, args=(handle,))
+            watchdog.daemon = True
+            watchdog.start()
+        try:
             raw = self._read(handle)
         except TransportError:
-            # A broken pipe means the bridge restarted. Drop the handle so the
-            # next call reconnects instead of failing forever on a dead one.
             self._drop_client_handle()
             raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
         if not raw:
+            # Empty read is the watchdog's ERROR_OPERATION_ABORTED, a closed
+            # handle, or a broken pipe -- all mean the answer is not coming.
             self._drop_client_handle()
-            raise TransportTimeout(
-                "named pipe closed while waiting for %s"
-                % (request or {}).get("method"))
-        if timeout_seconds and (time.time() - started) > float(timeout_seconds):
-            raise TransportTimeout(
-                "named pipe rpc timeout: %s" % (request or {}).get("method"))
-        return json.loads(decode_text(raw))
+            raise TransportTimeout("named pipe rpc timeout")
+        return raw
 
     def _drop_client_handle(self):
         handle = getattr(self._client_local, "handle", None)
@@ -259,6 +305,7 @@ class NamedPipeTransport(RpcTransport):
                 continue
             with self._server_lock:
                 self._server_handles.append(handle)
+                self._write_locks[handle] = threading.Lock()
             connected = dll.ConnectNamedPipe(handle, None)
             if not connected and self._last_error() != ERROR_PIPE_CONNECTED:
                 self._close_server_handle(handle)
@@ -310,7 +357,13 @@ class NamedPipeTransport(RpcTransport):
         if handle is None:
             raise TransportError("no pipe handle on the request to reply to")
         payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
-        self._write(handle, payload)
+        with self._server_lock:
+            lock = self._write_locks.get(handle)
+        if lock is not None:
+            with lock:
+                self._write(handle, payload)
+        else:
+            self._write(handle, payload)
 
     def _close_server_handle(self, handle):
         # 先把句柄从表里摘掉，摘到的那个线程才负责真正关闭。stop() 和工作线程
@@ -320,6 +373,7 @@ class NamedPipeTransport(RpcTransport):
             if handle not in self._server_handles:
                 return
             self._server_handles.remove(handle)
+            self._write_locks.pop(handle, None)
         dll = self._dll()
         # **必须先取消挂起的 I/O。** DisconnectNamedPipe 会等同一句柄上挂起的
         # 同步 ReadFile 完成，而工作线程正阻塞在那个 ReadFile 上等下一个请求 ——
@@ -356,9 +410,20 @@ class NamedPipeTransport(RpcTransport):
                 pass
         for handle in server:
             self._close_server_handle(handle)
+        dll = self._dll()
         for handle in clients:
             try:
-                self._dll().CloseHandle(handle)
+                # CancelIoEx BEFORE CloseHandle even though there is no pump:
+                # a send_request on another thread can have a blocking
+                # ReadFile pending on this handle, and CloseHandle on a
+                # synchronous handle with pending I/O blocks until it
+                # completes -- i.e. stop() hangs for as long as the server
+                # stays silent (this test's exact failure).
+                dll.CancelIoEx(handle, None)
+            except Exception:
+                pass
+            try:
+                dll.CloseHandle(handle)
             except Exception:
                 pass
         with self._server_lock:
