@@ -107,6 +107,127 @@ class ServiceContractTest(unittest.TestCase):
                 "%s 传输没有 drain_request_queue，adjust 会掉进 redis 兜底" % name)
 
 
+@WINDOWS_ONLY
+class DrainModeTest(unittest.TestCase):
+    """drain 模式：adjust 线程自己非阻塞轮询，不起工作线程。
+
+    background_threads=True 时实测请求要 ~200ms 才到达 handler，而 handler
+    本身 0.0ms —— 和 #183 记录的 zmq 404ms 同一个形状。#183 的解法是让
+    adjust 线程自己拉，去掉跨线程交接；这里给 pipe 补上同一条路。
+    """
+
+    def _pair(self, name):
+        srv = NamedPipeTransport(account_id="d", pipe_name=name)
+        srv.start_receiving(_echo, background_threads=False)
+        time.sleep(0.3)
+        cli = NamedPipeTransport(account_id="d", pipe_name=name)
+        self.addCleanup(srv.stop)
+        self.addCleanup(cli.stop)
+        return srv, cli
+
+    def test_nothing_is_answered_until_the_adjust_thread_drains(self):
+        """没人调 drain 就没人回答 —— 这正是 drain 模式的定义。"""
+        srv, cli = self._pair("bigqmt_test_drain_wait")
+        answers = []
+        t = threading.Thread(target=lambda: answers.append(
+            cli.send_request({"request_id": "d1", "method": "p", "params": {}}, 10)))
+        t.daemon = True
+        t.start()
+        time.sleep(0.6)
+        self.assertEqual(answers, [], "没 drain 就被回答了，说明还在走工作线程")
+        self.assertGreater(srv.drain_request_queue(max_items=20), 0)
+        t.join(timeout=5)
+        self.assertEqual(answers[0]["request_id"], "d1")
+
+    def test_the_service_can_answer_through_send_response(self):
+        """服务端不走 deliver 的返回值，它自己调 send_response 发响应。
+
+        drain 模式下没有工作线程，也就没有 outbox —— 第一版 send_response
+        强制要求 outbox，于是抛「no pipe handle」，客户端只看到超时。实盘上
+        就是这么卡住的：background_threads=False 一生效，一条都答不出来。
+        """
+        answers = []
+        holder = {}
+
+        def capture(req):
+            holder["req"] = req
+            return None                      # 模拟服务端：自己发，不靠返回值
+
+        srv = NamedPipeTransport(account_id="d", pipe_name="bigqmt_test_drain_sr")
+        srv.start_receiving(capture, background_threads=False)
+        self.addCleanup(srv.stop)
+        time.sleep(0.3)
+        cli = NamedPipeTransport(account_id="d", pipe_name="bigqmt_test_drain_sr")
+        self.addCleanup(cli.stop)
+
+        t = threading.Thread(target=lambda: answers.append(
+            cli.send_request({"request_id": "s1", "method": "p", "params": {}}, 10)))
+        t.daemon = True
+        t.start()
+        time.sleep(0.5)
+        srv.drain_request_queue(max_items=5)
+        srv.send_response(holder["req"], {"request_id": "s1", "ok": True, "data": {"v": 1}})
+        t.join(timeout=5)
+        self.assertEqual(answers[0]["data"]["v"], 1)
+
+    def test_drain_is_non_blocking_when_idle(self):
+        """空闲时 drain 必须立刻返回 —— 它跑在 adjust 主线程上。"""
+        srv, _cli = self._pair("bigqmt_test_drain_idle")
+        started = time.time()
+        for _ in range(5):
+            self.assertEqual(srv.drain_request_queue(max_items=20), 0)
+        self.assertLess(time.time() - started, 0.5, "drain 在空闲时阻塞了")
+
+    def test_drain_respects_max_items(self):
+        srv, cli = self._pair("bigqmt_test_drain_cap")
+        for i in range(6):
+            t = threading.Thread(target=lambda i=i: cli.send_request(
+                {"request_id": "c%d" % i, "method": "p", "params": {}}, 10))
+            t.daemon = True
+            t.start()
+        time.sleep(0.6)
+        self.assertLessEqual(srv.drain_request_queue(max_items=2), 2)
+
+    def test_background_mode_leaves_drain_a_no_op(self):
+        """开着工作线程时 drain 不能插手，否则两边抢同一个句柄。"""
+        srv = NamedPipeTransport(account_id="d", pipe_name="bigqmt_test_drain_bg")
+        srv.start_receiving(_echo, background_threads=True)
+        self.addCleanup(srv.stop)
+        time.sleep(0.3)
+        self.assertEqual(srv.drain_request_queue(max_items=20), 0)
+
+
+class BackgroundThreadResolutionTest(unittest.TestCase):
+    """新增传输时，「谁能走 drain」不能靠一张手写名单。
+
+    这张名单原来硬编码成 ("zmq", "mysql")，pipe 加进来时没人记得改它 ——
+    于是配置里写了 rpc_background_threads=False，日志里却是 True，drain 从
+    没跑起来，而我还拿那组数字下了「drain 没用」的结论。和入口文件手抄
+    QMT 全局函数名单（#202）是同一类错误。
+    """
+
+    def test_pipe_may_opt_into_drain(self):
+        from bigqmt_signal_trader_strategy import _resolve_background_threads
+        self.assertFalse(_resolve_background_threads("pipe", False))
+        self.assertTrue(_resolve_background_threads("pipe", True))
+
+    def test_a_transport_without_a_real_drain_keeps_its_thread(self):
+        """没实现 drain 的传输必须保留接收线程，否则一条请求都收不到。"""
+        from bigqmt_signal_trader_strategy import _resolve_background_threads
+        self.assertTrue(_resolve_background_threads("shm", False))
+
+    def test_the_decision_asks_the_transport_not_a_list(self):
+        from bigqmt_signal_trader_strategy import _transport_can_drain
+        for name in ("zmq", "mysql", "pipe"):
+            self.assertTrue(_transport_can_drain(name), name)
+        self.assertFalse(_transport_can_drain("shm"))
+        self.assertFalse(_transport_can_drain("nonesuch"))
+
+    def test_unset_keeps_the_historical_default(self):
+        from bigqmt_signal_trader_strategy import _resolve_background_threads
+        self.assertTrue(_resolve_background_threads("pipe", None))
+
+
 class FactoryTest(unittest.TestCase):
 
     def test_pipe_is_a_known_transport(self):

@@ -77,6 +77,8 @@ def _kernel32():
     dll = ctypes.WinDLL("kernel32", use_last_error=True)
     dll.CreateNamedPipeW.restype = wintypes.HANDLE
     dll.CreateFileW.restype = wintypes.HANDLE
+    # drain 模式要用它做非阻塞探测：有数据才 ReadFile，绝不在 adjust 线程上阻塞
+    dll.PeekNamedPipe.restype = wintypes.BOOL
     return dll, wintypes
 
 
@@ -111,6 +113,9 @@ class NamedPipeTransport(RpcTransport):
         self._wintypes = None
         self._listener = None
         self._server_handles = []
+        # drain 模式下由 adjust 线程轮询的已连接句柄
+        self._background_threads = True
+        self._drain_handles = []
         self._server_lock = threading.RLock()
         # Per-thread client handle. A single shared handle would serialise every
         # caller behind one round trip -- exactly the bug #186 fixed for the ZMQ
@@ -284,7 +289,21 @@ class NamedPipeTransport(RpcTransport):
 
     # -- server side -------------------------------------------------------
     def start_receiving(self, on_request, **kwargs):
+        """两种模式，和 zmq / redis 一致（#183）。
+
+        background_threads=True  每连接一个工作线程收发（原有行为）
+        background_threads=False adjust 线程在 drain_request_queue 里非阻塞轮询
+
+        实测 background_threads=True 时请求要 ~200ms 才到达 handler，而
+        handler 本身 0.0ms —— 和 #183 记录的 zmq 404ms 是同一个形状。drain
+        模式把读、处理、写全放回 adjust 线程，去掉跨线程交接。
+
+        两种模式下 accept 都留一个线程：它只阻塞在 ConnectNamedPipe 上，不碰
+        请求数据，代价是一个常驻线程而不是每连接一个。
+        """
         super(NamedPipeTransport, self).start_receiving(on_request)
+        background = kwargs.get("background_threads")
+        self._background_threads = True if background is None else bool(background)
         self._listener = threading.Thread(
             target=self._accept_loop, name="bigqmt-pipe-accept")
         self._listener.daemon = True
@@ -311,6 +330,10 @@ class NamedPipeTransport(RpcTransport):
             if not self._running:
                 self._close_server_handle(handle)
                 return
+            if not self._background_threads:
+                # drain 模式：不起工作线程，交给 adjust 线程轮询这个句柄。
+                self._drain_handles.append(handle)
+                continue
             worker = threading.Thread(
                 target=self._serve_connection, args=(handle,),
                 name="bigqmt-pipe-conn")
@@ -364,17 +387,72 @@ class NamedPipeTransport(RpcTransport):
                 pass
             self._close_server_handle(handle)
 
-    def drain_request_queue(self, max_items=20):
-        """没有队列要排空 —— 请求由每连接的工作线程直接投递。
+    def _peek_available(self, handle):
+        """这个句柄上有没有待读数据。PeekNamedPipe 不阻塞，可用于同步句柄。"""
+        dll = self._dll()
+        avail = self._wintypes.DWORD(0)
+        ok = dll.PeekNamedPipe(handle, None, 0, None,
+                               ctypes.byref(avail), None)
+        if not ok:
+            raise TransportError("PeekNamedPipe failed (err=%s)" % self._last_error())
+        return avail.value
 
-        **必须存在，哪怕是空实现。** 服务端 drain_request_queue 的兜底分支是
-        Redis 的 ``listen_redis.lpop``，而 pipe 部署上 listen_redis 是 None：
-        传输少了这个方法，adjust 每个 tick 都会撞
-        ``AttributeError: 'NoneType' object has no attribute 'lpop'``。
-        实盘上就是这么炸的 —— 单测抓不到，只有端到端能暴露。zmq 的
-        drain_request_queue 在 router 线程存在时同样是 no-op。
+    def drain_request_queue(self, max_items=20):
+        """drain 模式：adjust 线程自己把请求读出来、处理掉、把响应写回去。
+
+        读、handler、写全在同一条线程上，所以没有跨线程交接，也不需要
+        outbox + CancelIoEx 那套唤醒机制 —— 那套是 background_threads=True
+        时才需要的。
+
+        非阻塞：先 PeekNamedPipe 看有没有数据，有才 ReadFile。没有就跳过，
+        绝不能在 adjust 线程上阻塞等下一个请求。
         """
-        return 0
+        if self._background_threads:
+            return 0                 # 工作线程在收，这里不插手
+        processed = 0
+        for handle in list(self._drain_handles):
+            while processed < int(max_items):
+                try:
+                    if not self._peek_available(handle):
+                        break
+                    raw = self._read(handle)
+                except TransportError:
+                    self._forget_drain_handle(handle)
+                    break
+                if not raw:
+                    break
+                try:
+                    request = json.loads(decode_text(raw))
+                except Exception:
+                    self._forget_drain_handle(handle)
+                    break
+                request["_pipe_handle"] = handle
+                response = None
+                try:
+                    response = self.deliver(request)
+                except Exception as exc:
+                    response = {"schema_version": 1,
+                                "request_id": request.get("request_id"),
+                                "method": request.get("method"),
+                                "ok": False,
+                                "error": "%s: %s" % (exc.__class__.__name__, exc)}
+                if response is not None:
+                    try:
+                        self._write(handle, json.dumps(
+                            response, ensure_ascii=False, default=str).encode("utf-8"))
+                    except Exception:
+                        self._forget_drain_handle(handle)
+                        break
+                processed += 1
+        return processed
+
+    def _forget_drain_handle(self, handle):
+        try:
+            self._drain_handles.remove(handle)
+        except ValueError:
+            pass
+        self._close_server_handle(handle)
+
 
     def send_response(self, request, response):
         """Queue the answer onto the connection's outbox and wake its worker.
@@ -386,10 +464,16 @@ class NamedPipeTransport(RpcTransport):
         aborted read returns.
         """
         handle = (request or {}).get("_pipe_handle")
-        outbox = (request or {}).get("_pipe_outbox")
-        if handle is None or outbox is None:
+        if handle is None:
             raise TransportError("no pipe handle on the request to reply to")
         payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
+        outbox = (request or {}).get("_pipe_outbox")
+        if outbox is None:
+            # drain 模式：没有工作线程，adjust 线程是唯一的读者也是唯一的写者，
+            # 没有并发读写的问题，直接写。（漏了这一支时服务端自己发响应会抛
+            # 「no pipe handle」，客户端表现为超时，实盘上就是这么卡住的。）
+            self._write(handle, payload)
+            return
         outbox.put(payload)
         self._cancel_read(handle)
 
