@@ -22,6 +22,7 @@ using DEALER + ``poll`` (synchronous request/response fits the RPC model).
 import json
 import queue
 import threading
+import traceback
 import time
 import uuid
 
@@ -344,6 +345,42 @@ class ZmqTransport(RpcTransport):
         )
 
     def _router_loop(self):
+        """接收循环，出错自动重建 ROUTER 并继续（#240）。
+
+        原来这里是一层 try/finally：任何逃出内层 while 的异常都会走到 finally
+        关掉 socket、线程结束，**桥从此不再接收任何请求，也没有任何提示** ——
+        从客户端看和「服务端死了」一模一样，而 QMT 里的策略还好好地跑着，
+        adjust 照常打点。
+
+        redis 那两条循环早就是「异常 -> 退避 -> 重建连接」的形状；zmq 缺这一层。
+        现在补上：内层跑接收，外层负责重建。退避从 1 秒起、翻倍到 30 秒封顶 ——
+        端口被别的进程占着时不至于每秒刷屏。
+        """
+        backoff = 1.0
+        while self._running:
+            try:
+                self._router_session()
+                backoff = 1.0          # 正常退出（stop），不重连
+            except Exception:
+                if not self._running:
+                    break
+                print("%s zmq router failed, rebuilding in %.0fs:\n%s"
+                      % (self.print_prefix, backoff, traceback.format_exc()))
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                if not self._running:
+                    break
+                try:
+                    self._bind_configured_address()
+                except Exception:
+                    # 重建失败（端口还被占着）——下一轮继续退避重试，
+                    # 不能在这里放弃：放弃就回到了「线程静悄悄死掉」。
+                    print("%s zmq rebind failed, will retry" % self.print_prefix)
+                    continue
+                print("%s zmq router rebuilt bound=%s"
+                      % (self.print_prefix, self._actual_bind_address or self.bind_address))
+
+    def _router_session(self):
         poller = None
         if self._wake_recv is not None:
             try:
@@ -382,11 +419,15 @@ class ZmqTransport(RpcTransport):
             # closing a ZMQ socket from a different thread trips a signaler
             # assertion (abort); closing it here is safe because this thread
             # created and exclusively used it.
-            try:
-                self._router.close(linger=0)
-            except Exception:
-                pass
-            self._router = None
+            #
+            # 只在真正停机时关。重连路径上 _bind_configured_address 会建一个新的，
+            # 这里再关就把新 socket 关掉了 —— 那会让「重连成功」变成静默失效。
+            if not self._running:
+                try:
+                    self._router.close(linger=0)
+                except Exception:
+                    pass
+                self._router = None
 
     def _receive_request(self, flags=0):
         try:
