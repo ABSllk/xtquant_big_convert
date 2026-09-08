@@ -253,6 +253,49 @@ class QuoteSubscriptionManager(object):
             self._close_source(handle)
         return reaped
 
+    # -- diagnostics / force-clear ---------------------------------------------
+    def status(self):
+        """Read-only snapshot of what is subscribed and how fresh it is.
+
+        The report is the diagnostic for "I lost my seq and something is still
+        pushing": which combos exist, how many clients each thinks it has, and
+        how long since the freshest keepalive. A combo whose silence exceeds
+        the heartbeat timeout but has not been reaped yet is about to die;
+        one that stays fresh has a live keepalive feeding it (a leftover
+        client process, not a leak).
+        """
+        with self._lock:
+            now = self._now()
+            combos = []
+            for combo in self._combos.values():
+                latest = max(combo.clients.values()) if combo.clients else None
+                combos.append({
+                    "topic": combo.topic,
+                    "codes": list(combo.codes),
+                    "clients": len(combo.clients),
+                    "last_seen_seconds_ago": round(now - latest, 1) if latest is not None else None,
+                })
+            return {"heartbeat_timeout_seconds": self._heartbeat_timeout, "combos": combos}
+
+    def unsubscribe_all(self):
+        """Tear every combo down NOW, without needing any seq.
+
+        The operator kill switch for a subscription whose seq is lost. Every
+        source handle is closed, so big QMT stops pushing even for a combo
+        whose clients are still sending keepalives -- they will recreate the
+        combo on their next keepalive... no, keepalive is a no-op on unknown
+        sub_ids, so a force-cleared combo stays down until someone subscribes
+        again. Returns how many combos were closed.
+        """
+        with self._lock:
+            combos = list(self._combos.values())
+            count = len(combos)
+            self._combos = {}
+            self._sub_index = {}
+        for combo in combos:
+            self._close_source(combo.handle)
+        return count
+
     # -- internals -------------------------------------------------------------
     def _make_on_push(self, key):
         def on_push(data):
