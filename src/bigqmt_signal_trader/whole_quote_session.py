@@ -90,8 +90,12 @@ class WholeQuoteClientSession(object):
     # -- heartbeat -------------------------------------------------------------
     def start(self):
         with self._lock:
-            if self._started:
+            thread = self._heartbeat_thread
+            if self._started and thread is not None and thread.is_alive():
                 return
+            # A past replay exception may have killed the loop while _started
+            # stayed True (#231) -- "started" must mean "a live thread",
+            # otherwise start() never recovers it.
             self._started = True
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop, name="bigqmt-quote-keepalive", daemon=True
@@ -133,7 +137,13 @@ class WholeQuoteClientSession(object):
                 # Server is back after a restart window: replay subscriptions so
                 # the restarted server re-creates the big-QMT subscriptions (its
                 # state is gone). Idempotent on the server, so replays are safe.
-                self.replay_subscriptions()
+                # The replay is itself an RPC and can fail while the window is
+                # still open -- that must never kill this loop (#231): a dead
+                # heartbeat leaves every subscription to age out server-side.
+                try:
+                    self.replay_subscriptions()
+                except Exception:
+                    pass
                 consecutive_failures = 0
             else:
                 consecutive_failures = 0
@@ -148,7 +158,12 @@ class WholeQuoteClientSession(object):
                 silence_rounds += 1
             prev_last_push = last_push
             if silence_rounds >= self._push_silence_replay_heartbeats:
-                self.replay_subscriptions()
+                # Same rule as the recovery replay above: a failed replay is a
+                # retry next round, never a dead loop (#231).
+                try:
+                    self.replay_subscriptions()
+                except Exception:
+                    pass
                 silence_rounds = 0
             time.sleep(self._heartbeat_interval)
 

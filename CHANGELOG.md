@@ -11,8 +11,12 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **无数据窗口返回 `1970-01-01` 全零占位行**（#228）。大 QMT 对自己没有数据的窗口不返回 0 行，而是返回 1 行 `stime=19700101`、OHLC/volume 全零的占位行；客户端归一化后变成索引 `19700101`、`time=-28800000`（纪元零点的中国时区），调用方当成真 Bar。下游按行推自然周边界，拿 `marker=1970-01-01` 查交易日历 `1969-12-29~1970-01-04` 为空直接抛错——生产实例 09:11 盘前崩在这里，并已把 `bar_time=1970-01-01` 脏行写进库。miniQMT 对无数据窗口返回空 DataFrame，本桥承诺对齐它。现在归一化按行丢弃标签早于 `19900101`（A 股开市之前，不可能是真 Bar）的行；日期合理的零值行照常保留（停牌日本来就零量，`fill_data=True` 也是有意补的）。实测（0.3.26，2026-09-08 盘前，窗口 `20261012~20261018`）：000001.SZ / 600519.SH / 300750.SZ 全列 RPC 路径修前均返回该占位行，修后返回空；显式字段（FormulaServer）路径两端都返回空，所以只有全列 RPC 路径受影响。
-- **进行中的多日周期 Bar（1w/1mon/1q/1hy/1y）按请求窗口截断**（#226）。盘中大 QMT 把进行中的周线按请求窗口内的基础数据现场合成——窗口只含当日时，周线的 volume/OHLC 只剩当日部分，本周前几天的量丢失（miniQMT 的 `get_local_data` 语义是从本地全部数据合成、窗口只过滤返回行）。现在客户端在返回前对进行中的 Bar 用周期内日线重造（volume/amount 求和、high/low 取极值、open 取周期首日开盘、close 取最新收盘；preClose/time 不动）。结构性触发：周期集合钉死 + 最后一根 Bar 的自然周期包含今天 + 请求窗口切进周期 + 盘中时段——收盘后已定型、窗口已覆盖周期、日线请求失败或为空时都原样放行（失败保留原值并告警，不抛错）。`resynth_ongoing_multiday=False` 可关。盘后实测：重造值与定型 Bar 逐值一致。
+- **进行中的多日周期 Bar（1w/1mon/1q/1hy/1y）按请求窗口截断**（#226）。盘中大 QMT 把进行中的周线按请求窗口内的基础数据现场合成——窗口只含当日时，周线的 volume/OHLC 只剩当日部分，本周前几天的量丢失（miniQMT 的 `get_local_data` 语义是从本地全部数据合成、窗口只过滤返回行）。现在客户端在返回前对进行中的 Bar 用周期内日线重造（volume/amount 求和、high/low 取极值、open 取周期首日开盘、close 取最新收盘；preClose/time 不动）。结构性触发：周期集合钉死 + 最后一根 Bar 的自然周期包含今天 + 请求窗口切进周期 + 盘中时段——收盘后已定型、窗口已覆盖周期、日线请求失败或为空时都原样放行（失败保留原值并告警，不抛错）。`resynth_ongoing_multiday=False` 可关。**盘中判别实锤**（2026-09-08 11:39，维护者终端 000001.SZ）：原始答案当日窗口 430,935（截断）→ 修复后当日窗口 == 整周窗口 == 1,518,211。
 
 ### 新增
 
@@ -20,17 +24,29 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **批量撤单应答不再复述原生返回值当结论**（#224 跟修）：原生 cancel 返回值两个方向都会说谎（#148 假失败 / #151 假成功），批量逐项应答现在区分 `accepted`（网关已受理）与 `confirmed`（恒 False——此路径不读回确认，撤单确认看委托状态推送 54 或查询）；失败文案不再写「rejected」，改为明说「未被确认，单子可能仍会撤掉，以状态推送/查询为准」。批量超时/断连不重提（#195 的撤单侧镜像）；服务端明确拒绝或返回空才回退逐笔。`on_cancel_error` 回调补上 `seq`（此前无法关联是哪笔）。
 
 ## [0.3.26] - 2026-09-07
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **区间除权因子在终端缺日线时先自救再报错**（#222，#165 后续）。`get_divid_factors(code, start, end)` 的区间展开要扫终端本地日线找昨收跳变，终端窗口内日线不足 2 根时此前直接 `RuntimeError("Download the daily history first")`——把自救推给调用方；而调用方自己的库里日线往往是齐的，增量下载因此跳过、终端永远没数。现在桥在扫描不足时自己调终端的下载器（注入的 `download_history_data` / `down_history_data`，不走大 QMT 里没有可达数据服务的内嵌 xtdata SDK）补一截日线，短缰绳重扫后仍不足才抛。#165 的底线不动：不许静默空 dict。报错文案区分「没有下载通道」和「下过但仍缺」两种成因。维护者终端实测下载 0.3s 应答、数据立即可读。
 
 ## [0.3.25] - 2026-09-07
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **期货/期权查询行的买卖方向读错字段**（#217）。`_action_from_offset_flag` 把 `m_nOffsetFlag` 直接当方向（48=买/49=卖）——那是股票事实；期货和 ETF 期权的 offset 是开/平仓，于是**卖出开空**（offset=48 开仓）被报成 BUY、**买入平仓**（offset=49 平仓）被报成 SELL。直通 opType 表（期货 0-15、ETF 期权 50-55，与仓内 API 参考一致）本来就带着方向，现在 FUTURE / STOCK_OPTION 账户的查询行优先从 `m_nOpType` 读方向，无方向的行（56/57 行权）回落 offset；股票路径不动。
 
@@ -61,6 +77,10 @@
   **运行时告警**：静态闸保证我们自己不写漏，但挡不住「换一家券商行为不一样」。所以交易类响应回来「行数对、字段全空」时记一条 warning，把 QMT 函数名和当前线程名一起写出来，60 秒节流（跑错线程时每次查询都 hollow，不节流会刷爆日志，#139 的教训）。**只告警、不自动改路由**：defer 实测只要 2.5-3.0ms（和 inline 的行情读 3.3ms 同量级），而猜错方向的代价是静默返回错数据，两边完全不对等；何况「跑错线程」和「这个账户真没数据」从返回值上分不开，据此自动切换只会把一次误判固化下来。让「每家不一样」成为被观测到的事实，而不是被猜测后自动应对的。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **陈缓存默认不再交出（`max_age_seconds`，默认 120 秒）**：查柜台这条通道的缓存**从不自己刷新** —— 没人调就永远不刷，`age_seconds` 可以是 44 秒，也可以是三小时。真正的风险不是「30 秒 vs 0 秒」，而是一个只读 `rows`、不看 `age_seconds` 的调用方，拿几小时前的**维持担保比例**去做决策还毫无察觉；那是强平线，读错方向是真损失。
 
@@ -152,6 +172,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **无 redis / 纯 zmq 部署此前跑的是旧 transport**：`bigqmt_no_redis/zmq_transport.py` 是手工维护的自包含分支（内联了 redis 依赖、去掉服务发现，好在拒绝 `import redis` 的 QMT 沙箱里加载），**没有生成脚本，所以从 7 月 29 日起悄悄漂了** —— 源码 transport 后来拿到 #177（回复入队即唤醒 router，交易查询 1500→605ms）和 #186（每线程一个 DEALER，多线程并发不再排队），这个分支一个都没跟上。而单文件构建器正是**用这个分支覆盖**源码 transport，所以最需要低延迟的纯 zmq 部署，恰恰在跑最旧的那份。
 
   已从当前源码重新生成（同样的去 redis 变换），现在带上 #177、#186、卡顿看门狗和 reply-residency 统计。验证：断掉 redis 也能独立导入、无 redis 命名的 import 残留、no-redis 单文件构建内联了新代码并编译通过。
@@ -187,6 +211,10 @@
   **实盘未验证**：这是纯客户端改动，而当前部署跑的是 redis transport，根本不经过这段代码；要验它得把终端换成 zmq 再重启。离线用假 socket 钉住了真正的回归 —— 4 个并发调用在一次 0.3 秒往返里必须重叠而不是排队（修复前 4 例红）。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **批量 RPC 超时后不再回退重提 —— 双倍下单（#195，实盘 100 单变 200 单）**：`order_stock_async` 的积压走一个批量 RPC，服务端在 adjust 线程上串行执行（柜台断连时 ~300ms/项，100 项 >30s 默认超时）。客户端超时放弃后，旧兜底「逐笔重提」启动 —— 但**服务端的批量还在跑而且会跑完**，于是 100 + 100 = 200 单。超时不等于没执行。
 
@@ -244,6 +272,10 @@
   README 的传输表、FormulaServer 对比表、基准表、配置注释、排查指引，以及 `docs/RPC_TRANSPORTS.md` 的传输表和实测段全部更新，并注明「0.3.21 之前这张表是反的」。三处「必须设 True」改成推荐 `False`。顺带记上 zmq 客户端并发无效（#186）—— 只有 redis 上多线程能提升吞吐。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **异步下单被批量端点吞掉，而且吞掉的单返回 success**（#190，实盘报告，#181 的回归）：0.3.20 正常，之后的 main 上「循环里单独调用下单一单也下不出去，插一个别的调用就又能下」，以及「同时下很多单、回调回来一堆、委托列表里只有一单」。两条是同一个根因。
 
@@ -327,6 +359,10 @@
   **未验证**：期货（金额 = 均价×数量×合约乘数）和港股通的 `m_dTradeAmountRMB` 未测；推送路径（`normalize_order_event` 的 `trade_amount`）只有离线用例，当日收盘后没有新委托回调可看，没有实盘样本。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **成交回调终于带上 `strategy_name`，委托回调不再只靠 Redis**（#174，@sumo225270 报告）：`on_stock_order` / `on_stock_trade` 拿到的策略名恒为空，而下单时传的是非空串；`instrument_name` / `order_remark` 一切正常。查下来是**两个**不同的原因。
 
@@ -429,6 +465,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **撤单不再永远用网关自己的账号**（#168，随 PR #171 一起）：`cancel()` 原来两个值都取自网关自身 ——
 
   ```python
@@ -488,6 +528,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **`get_divid_factors` 的区间请求被坍缩成只查 `end_time` 单日**（issue #165，@yucejade）：任意区间都被压成一天，而任何一天几乎都不是除权日，于是区间请求恒返回 `{}` —— 而空 dict 和「区间内没有事件」**完全分不出来**。报告人按 xtdata 区间语义做的盘前全市场复权因子同步就这样跑了近一个月：每只都空，因子表静默停更，K 线照常更新，一声不响。
 
   代码里原来的注释写着「xtdata SDK 也是 2 参数」——**这句是错的**，终端自带 SDK 是 `get_divid_factors(stock_code, start_time, end_time)`。
@@ -539,6 +583,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **一笔委托触发两次「已报」回调，第一次还是残缺事件**（issue #161，@sumo225270）：QMT 在委托行出现时和 `m_strOrderSysID` 填上后各触发一次 order_callback（#152 的同一窗口），客户端于是看到两条一样的「已报」，第一条无委托号（order_id=0）。现在无委托号的委托事件**扣留 0.8 秒**：带号孪生到达即丢弃（只发一次完整事件），没来则由 adjust 循环补发（不丢事件）。扣留窗口可用 `exec_events_hold_presysid_seconds` 配置，设 0 恢复旧行为。实盘验证（国金 2.1.19.0）：废单路径从「50 无号 + 57 带号」两条变 1 条完整事件。**已报-已报的去重形状需开盘时段复验**（当前已过收盘，只能走废单路径）。
 
 - **回调事件缺 `instrument_name`**（issue #161）：事件规范化没带这个字段。现在 QMT 对象自带就用自带的，没有则服务端用 ContextInfo 查一次并缓存（同一代码只查一次），委托/成交事件都带上。客户端 `order.instrument_name` / `trade.instrument_name` 直接可用。实盘验证：`name='工商银行'` ✓。
@@ -552,6 +600,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **`get_trading_dates` 每次调用都白烧 2 秒**（issue #160，@heimo88）：他看到的是策略启动后第一次 21.6s（SDK 冷初始化），我们实盘实测发现**每次调用都 ~2.1s**——`_native_or_context` 每个调用都先让原生 xtdata SDK 去拨它在大 QMT 里永远连不上的行情服务，超时报错后才回落 ContextInfo。而「SDK 在、行情服务不在」在大 QMT 进程里是**不会自愈的永久状态**。现在原生失败按函数名记住 600 秒，窗口内直接走 ContextInfo（成功一次即清除标记）；全部 15 个 `_native_or_context` 调用点受益（`get_holidays` 等含）。回归测试 5 个（修复前 4 个失败）。**生效需同步 QMT 端并重启策略**。**已实盘验证（0.3.16 + 本条部署后）**：reload 后首次 2.5s（最后一次 SDK 实拨），之后每次 **30-46ms**。
 
 - **`xt_trader.sync_deployment()` 从来是坏的**：它调 `self.get_deployment_info()`，而该方法只在 `BigQmtXtData` 上——trader 路径一调就 AttributeError（在部署 #160 时踩到）。改为直接走 `self.client.call("get_deployment_info")`。回归测试 2 个（修复前均失败）。
@@ -560,6 +612,10 @@
 ## [0.3.16] - 2026-09-03
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **`order_stock_async` 排了队没发出去的委托随进程退出静默丢失**（issue #156，@kingtsi）：循环连发 async 下单后脚本立即退出——worker 是 daemon 线程，主线程一结束它就被掐死，队列里剩下的委托一笔都不发、没有任何报错；他的 sleep 只是在给进程续命。实盘复现（工行 100 股 ×3 深价单）：立即退出 3 笔只到 1 笔，`wait_async_orders()` + 宽限 3/3。
 
@@ -590,6 +646,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **无 redis 部署里 `strategy_name` 查询永远回填不上**（issue #156 / #133）：QMT 的委托/成交行根本不携带策略名（终端按它过滤、但不报告），桥靠提交时记的 redis 身份库在查询时回填 —— 但 zmq 单文件等无 redis 部署没有身份库，`strategy_name` 永远读 `''`。现在服务端同时维护一份**进程内身份日志**（提交时记 `remark -> strategy_name`，5000 条 FIFO + 24h TTL，与 redis 店同规则）：没 redis 的部署里，凡本进程提交过的委托，查询都能回填策略名。redis 仍是主店（跨重启、跨进程）。回归测试 6 个（修复前 3 个失败）。
 
 - **zmq 传输 + redis 可达的部署里，委托/成交回调永远收不到**（issue #144，@sumo225270）：服务端发布执行事件是「**redis 优先**」——只要能建出 redis 客户端就发 redis 通道（流带短回放），连挂多次才降级到 zmq 推送通道（#145）。而客户端 `_event_loop` 是**按 transport 选的**——zmq 传输只听 zmq 推送通道。于是这类部署里每个事件都发在 redis 上，客户端却在另一个通道上听：`on_stock_order` / `on_stock_trade` 静默全丢。
@@ -617,6 +677,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **单文件构建丢掉了 zmq 绑定地址和 transport**（issue #153，@simonfantasy）：向导里填了 QMT 机器的局域网地址，生成的 `local_config.py` 里是对的 `"zmq": {"bind_address": "tcp://0.0.0.0:15618"}`，但跑起来的 FLAT 构建打印 `zmq started bound=tcp://127.0.0.1:15618`，跨机连不上。
 
   报告人的判断是对的：**单文件部署从来不读 `local_config.py`** —— `_load_local_config()` 是拿构建文件顶部那个内嵌配置块**合成**出这个模块的。所以内嵌块**就是**配置，而生成它的 `render_single_file_config_block()` 少了两个 key：
@@ -638,6 +702,10 @@
 ## [0.3.13] - 2026-09-02
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **已到券商的委托被报成 `-1`（拒单）**（issue #152，@willzhqiang）：同步下单返回 `-1`，客户端打出 `ORDER_REJECTED`，而按同一个 remark 立刻回查，委托**就在券商那里**：`order_sysid 635093411 / status 50 REPORTED / cancelable true / 冻结 421.72`。
 
@@ -755,6 +823,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **连不上的 redis 会吞掉委托/成交回调**（issue #145，@heimo88）：`_exec_event_sink` 只要 redis「available」就优先，而 available 只意味着**配了**。redis-py 是惰性连接的，配了但连不上时 client 建得出来、每次 publish 才超时 —— **回调全丢，而旁边工作正常的 zmq 推送通道一次都没被用上**，每个事件还刷一整段 traceback。
 
   现在：publish 失败**立刻回落到推送通道**（回调照样送达，不再丢）；连续 3 次失败降级 redis，且**只在有地方可降时才降**（降到 None 等于把吵闹的失败变成静默的失败）；traceback 限流 —— 前 3 次全量（issue #76 挣来的），之后每 50 次一行摘要。
@@ -774,6 +846,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **失败的 QMT 登录被报成启动成功**（PR #141，@willzhqiang）：FormulaServer 的 58600 端口**在登录框还开着的时候就已经在监听**。`open_qmt()` 提交凭据后立刻用这个端口判就绪，于是券商拒绝或超时的登录会被当成终端启动成功 —— 而桥根本没挂上。
 
   实盘复现（#140 合并后做负向路径验证时发现）：账号密码正确填入并提交、**58600 在监听**、登录框仍在、QMT 报 `200003 超时`，`XtClient` 日志里 `CProxyClient::onLogin ... status = 21`、`slot_onLoginStatus ... 错误200003,超时`。旧的就绪检查立刻返回成功。
@@ -791,6 +867,10 @@
 ## [0.3.10] - 2026-09-01
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **QMT 自动登录在 DPI 缩放下点错位置**（PR #140，@willzhqiang）：**这条解释了 0.3.8 里记的那次实盘事故** —— 「账号框坐标原本打在右侧下拉箭头上，导致密码被追加进账号框」。当时挪了坐标、加了字段级像素验证，但**没找到坐标为什么会偏**。
 
@@ -830,6 +910,10 @@
   **股票账号收到期货 opType 直接抛错，不回落到 23/24** —— 回落会发出一笔品种和方向都不对的真实股票单。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **`bigqmt-init` 生成的 ZMQ 客户端从来连不上**（PR #137，close #136，@willzhqiang）：向导和传输层各算各的端口 —— `15000 + n%1000` vs `15560 + n%100`。两者要相等得满足 `(n%1000)-(n%100) == 560`，而这个差恒为 100 的倍数，**560 不在里面**。暴力验证 0..99999：**0 个账号能对上**。而症状只是一个干巴巴的超时。
 
@@ -881,6 +965,10 @@
 - **docs/LATENCY_REPORT.md**：延迟报告独立成文（传输层对比、FormulaServer 直连、下单链路各环节、方法论声明）。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **`query_stock_orders` / `query_stock_trades` 字段缺失**（Issue #133，@sumo225270）：委托缺 `account_type` / `instrument_name`，成交缺 `account_type`，两边 `strategy_name` 恒为空。三个字段三个不同原因：
 
@@ -967,6 +1055,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **可转债的最小申报量、市场推断与报价精度**（PR #121）：三处同一个原因——代码里没有「债券」这个概念，一律按股票处理。
 
   | 位置 | 修复前 | 后果 |
@@ -1023,6 +1115,10 @@
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **长代码列表恢复失败时抛出无意义的错误**（Issue #104，@frank0532 在 0.3.4 上报告）：
 
   ```
@@ -1053,6 +1149,10 @@
 ## [0.3.4] - 2026-08-30
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **回测：三个报告，两个原因**（Issue #109，@wolfeee）
 
@@ -1093,6 +1193,10 @@
 ## [0.3.3] - 2026-08-30
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **未知 `order_type` 的报错误导性极强**（Issue #92）：传 `order_type=27` 得到的回应是 `action or order_type is required`——可调用方明明传了。报告人因此两次回来贴同一份 traceback，间隔半小时，一字不差；两次都在检查自己的调用。
 
@@ -1135,6 +1239,10 @@ if xt_trader.cancel_order_stock(acc, order_id) == 0: # ✓
 这是有意向 MiniQMT 契约靠拢。原来的 bool **把判断反过来了**：MiniQMT 的写法是 `== 0`，而 Python 里 `False == 0` 为 True，所以撤单**失败**被读成成功，**成功**被读成失败。而我们自己的异步回调早就在用 `cancel_result=0` 表示成功，同一套 API 的两半互相矛盾。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **返回类型与 MiniQMT 不符**（Issue #113，@tokens-lin）：报的是 `order_stock` 返回字符串而不是数字。顺着查了整个接口面，同类问题三处：
 
@@ -1196,6 +1304,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **信用委托类型被塌缩成普通买卖**（Issue #103）：`order_stock(acc, code, 27, ...)` 返回「不支持该类型」。有两层，第二层更危险：
 
   - RPC 只认 `23` / `24`，其余一律 `action or order_type is required`
@@ -1241,6 +1353,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 - **`OrderSnapshot.price_type`**：委托快照透出报价类型（m_nOrderPriceType），并补 `traded_price`；shim 新增 `xtdata.get_stock_type` 转发。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **纯 ZMQ 模式隐式连 Redis**（PR #108）：`publish_event`/`save_quote_subscription` 在无 redis discovery 的纯 ZMQ 下直接跳过，不再隐式建 redis 连接。
 - **日线缓存日期窗口全滤光**（PR #108）：缓存为 8 位日期轴而调用方传 14 位 start_time 时字符串比较清空全部数据，现在按缓存轴精度对齐下限。
@@ -1290,6 +1406,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
   **同步逻辑跑在客户端，不在 QMT 内。** 让交易进程盘中改写自己的代码，等于把源码树里的任何东西——包括改到一半的——直接送上实盘。每次结果都带 `restart_required`：拷贝本身不生效，必须重启策略。
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **`__version__` 卡在 `0.2.0` 已十五个版本**，因而无法回答上述任何问题。现跟随 `pyproject.toml`，由测试钉住，并要求 `CHANGELOG` 中存在对应条目。
 
@@ -1353,6 +1473,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **期货合约符号被大写化，共三处**（Issue #95）：各交易所命名规范不可互换（上期所 `rb2401`、郑商所 `AP401`），大写后是 QMT 不认识的代码——**返回空行情、不报错**，与"没有数据"无法区分。
 
   `#68` 当初靠**绕开** `normalize_stock_code` 解决了持仓路径，其余路径（下单、行情、全推缓存、风控）仍从这里过。三处依次是 `code_utils.normalize_stock_code`、`full_tick_cache.normalize_full_tick_codes`（在 `normalize_stock_code` **之前**又大写一次）、`market_bigqmt.normalize_market_or_stock_code`（同样在委托前大写，**使前两处的修复到不了 `get_full_tick`**——恰是本 issue 报告的路径）。
@@ -1398,6 +1522,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **`get_ipo_data` 的响应被清空**（实盘发现）：它返回**以申购代码为键的 dict**，却被送进 `_normalize_detail_rows`。那个函数对 dict 做 `for row in rows`——迭代的是**键**，再拿每个代码字符串去抓属性：
 
   ```
@@ -1431,6 +1559,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 ## [0.2.13] - 2026-08-27
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **`account_type` 三个配置位置里两个静默失效**（Issue #92）：信用账户按 STOCK 查询**不会报错**——`get_trade_detail_data` 返回一行全 0 的资产。所以这个设置错了，表现就是「信用账户资产全是 0」，日志里没有任何线索。
 
@@ -1496,6 +1628,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **负债合约查询少传一个参数**（PR #87，@ljjtim）：`get_unclosed_compacts` / `get_closed_compacts` 只传了 `accountID`，而 `docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md` 6.16 记载的签名是两参数、`accountType` 填 `'CREDIT'`。旁边三个单参数接口（`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract`）未受影响，与文档一致。
 
 - **`account_id is required` 说不清问题在哪**（Issue #90）：原来整条消息就一句 `Big QMT account_id is required`，**不说自己找过哪些模块**——所以「配置文件建了但放在当前解释器 import 不到的位置」和「压根没建配置文件」产生的报错一模一样。报告人其实已经建了那个文件。
@@ -1527,6 +1663,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **单文件 QMT 沙箱构建无法加载：`from xtquant.xtconstant import *` 是语法错误**（Issue #76）：单文件构建把每个模块塞进函数体 exec，而 `import *` 只允许在模块级，报 `SyntaxError: import * only allowed at module level`。这是 0.2.10 里 #73 引入的——它删掉 `xtquant_compat` 中 110 个硬编码常量、改用 `import *` 兜住。
 
   **只导入实际用到的 3 个名字会修好语法、同时弄坏别的东西**：`import *` 拉进 534 个名字，模块自身只用 `ORDER_UNKNOWN` / `STOCK_BUY` / `STOCK_SELL`，但 `docs/XTQUANT_COMPAT_REPLACEMENT.md` 记载的「接入方式一」是 `from bigqmt_signal_trader import xtquant_compat as xtconstant`，即调用方从本模块读常量。改为显式循环回填，**539/539 全部保留**并逐个与来源比对。没有使用模块级 `__getattr__`：PEP 562 是 Python 3.7+，而 QMT 自带 3.6（`bin.x64/python36.dll`）；4 个混合大小写常量（含原生 SDK 拼写的 `OFFSET_FLAG_ClOSEYESTERDAY`）也排除了按 `.isupper()` 过滤的写法。
@@ -1551,6 +1691,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **zmq 部署收不到任何回调推送**（Issue #76）：order/trade 事件**两端都硬绑 Redis**——服务端 `_publish_exec_event` 建不出 Redis 客户端就直接 `return`，客户端 `_event_loop` 只订阅 Redis 频道。纯 zmq 部署因此完全收不到 `on_stock_order` / `on_stock_trade` / `on_order_error`，而且是**静默的**：客户端只是连不上然后无限重试，服务端把「没有 Redis」当正常跳过。现在 exec 事件复用已有的全推行情 PUB 通道（不新开端口），Redis 仍优先（其频道带 stream 可做短重放）。报告人读代码就把这个推了出来。
 - **adjust 每个 tick 都在新建 Redis 客户端**（PR #79）：`_pump_download_jobs` 每次运行都建一个新客户端，而它每个 tick 都跑——按 100ms 间隔就是**每秒 10 个**，每个带一套连接池。症状是 QMT 面板里的 `AttributeError: 'Redis' object has no attribute 'connection'`（redis-py 的 `__del__` 跑在构造未完成的对象上），一天 31 次。Python 把它吞成 `Exception ignored in`，所以**从没进过 `bigqmt.log`**。`_exec_event_redis` 早已为同样理由加过缓存，此处被漏掉；修复是复用同一个缓存 helper。
 - **一行无法解析的数据搞垮整个查询**（PR #70）：#73 让 `_full_code` 遇到柜台式交易所 ID 时抛异常——信号本身对，但三个调用方的行循环都无逐行保护，异常一路抛出 `get_positions` / `query_orders` / `query_trades`。一行异常 = 整个持仓查不到；`query_orders` 外层 `except` 返回 `[]`，丢的是全部委托。现在跳过该行、其余照常返回。
@@ -1573,6 +1717,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **redis-py 3.5.3 兼容（PR #67 回归，Issue #71）**：`build_redis_client` 无条件传 `protocol=` 在 QMT 自带的老 redis-py 上直接 TypeError——且 QMT 策略重跑后执行事件发布器重建客户端时崩掉，事件被静默全丢（发布器构建失败现在会记日志，不再无声）。改为按版本能力（inspect.signature）条件透传；客户端 `_redis()` 同步处理。
 - **async_response 没有真实 order_id**（Issue #72）：委托号异步分配、RPC 应答时通常还没有，order_id 只能回落成 remark，按 order_id 管理委托的代码会解析失败。现在 response 触发前等屏障从暂存的委托事件里学到真实委托号（bounded 2s，学不到才回落 remark）。下单仍走 wait_settlement=False 快速应答（#50/#69 的吞吐不回退）。实盘验证：`async_response order_id=xt1090519419`（真实委托号）。
 - **#69 发单间隔**：0.5s 检查已在 #44 改为结算停放（不阻塞提交）——见 issue 回复，无需改动。
@@ -1580,6 +1728,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 ## [0.2.8] - 2026-08-25
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **期货持仓代码解析错误**（PR #68，@ReCodeLife）：裸期货合约（交易所字段为迅投简称 DF/SF/ZF）被错误送进股票归一化并抛 invalid stock code。改为**按交易所字段分类，不再猜代码形状**：迅投简称（IF/SF/DF/ZF/INE/GF）拼接后缀并**保留符号原始大小写**（`rb2401.SF` 小写 / `AP401.ZF` 大写，两者不可互换）；股票/港股通走归一化；`code_utils` 补 `.HGT` / `.SGT` 后缀识别。
 - **一行无法解析的数据会搞垮整个查询**（PR #70）：上一条让 `_full_code` 遇到柜台式交易所 ID 时抛异常——信号本身是对的，但三个调用方的行循环都没有逐行保护，异常会一路抛出 `get_positions` / `query_orders` / `query_trades`。**一行异常 = 整个持仓查不到**；而 `query_orders` 外层 `except` 返回 `[]`，丢的是全部委托。对交易系统而言这比它要报告的问题更危险，也与本模块「降级而非崩溃」的既定风格矛盾（POSITION 查询外的 try/except 注释即为 *degrade to empty*）。现在跳过解析不了的那一行、其余照常返回，跳过按 `(kind, exchange)` 只记一次日志。
@@ -1604,11 +1756,19 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - PR #67 合入修正：`_position_object` 的 m_ 别名引用了未定义局部变量（`stock_code`/`stock_name` 只内联在 kwargs 里），持仓查询全挂——提取为局部变量并补回归测试钉住全部别名。
 
 ## [0.2.6] - 2026-08-24
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **回调对象字段命名不一致**（Issue #65）：`on_order_error`/`on_cancel_error`/async 回报的委托号字段是 `order_sys_id`，而 `on_stock_order`/`on_stock_trade` 用 MiniQMT 规范名 `order_sysid`。全部回调对象现在同时携带两个名字（同值），另补 `order_remark`/`status`/`strategy_name`。
 - **on_order_error 缺 order_remark/status**（Issue #64）：服务端事件补上 `m_strRemark`→`order_remark`/`user_order_id` 与 `m_nOrderStatus`→`status`，撤单错误事件同步补齐。柜台的拒单理由此前已在 `error_msg`（m_strCancelInfo，#60）。
@@ -1621,6 +1781,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 ## [0.2.5] - 2026-08-21
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **get_full_tick 返回 key 被全大写**（Issue #58）：代码 upper() 后传给 QMT，返回时未映射回调用方写法。期货交易所的合约代码是小写（`rb2708.SF`、`a2609.DF`、`nr2612`），导致 `code in result` 对每一个都失败、实时五档被误判缺失。现在只还原**大小写**，不动归一化——`600000` 仍补全为 `600000.SH`，补全后缀是调用方依赖的行为。QMT 主动返回而未被请求的 key 原样透传，不丢行情。
 - **柜台拒单原因没有传出**（Issue #60）：`status_msg` 与 `error_msg` 在废单时均为空，形如 `[COUNTER] 资金可用余额不足，尚需[4789.630]` 的原因完全丢失。两处缺口：`OrderSnapshot` 没有 `status_msg` 字段；`normalize_order_error_event` 只读 `m_strErrorMsg`。柜台文本实际在 `m_strCancelInfo`（官方字段表标注为「废单原因」，状态 57 明确指向它）。已贯通 `OrderSnapshot` → `order_bigqmt` → 委托事件 → `_order_from_dict`，`order_error` 事件改为优先读该字段。
@@ -1650,6 +1814,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **qmt_launcher mode=login 打不进密码**：SendMessage 把键消息发给顶层窗口，但 Qt 对话框只在窗口持前台焦点时才把按键路由给输入框——后台进程发送等于静默丢弃。改为物理输入（keybd_event/mouse_event）：Alt 键解锁前台保护 → 置顶 + 前置 → 物理点击字段 → 打字。账号预填时先 Ctrl+A 再覆盖（否则变成追加）；密码框点击位置避开右侧虚拟键盘图标；控件坐标按窗口尺寸比例定位。已是大窗（主界面=自动登录完成）时跳过整个输入流程，避免密码打进主窗口控件。
 - **登录框就绪判定**：58600 端口在登录前就监听，launcher 的端口就绪不等于"已登录可用"——docstring 已注明，建议以 RPC ping 为真正就绪信号。
 
@@ -1664,6 +1832,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ### 修复
 
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
+
 - **异步下单的 order/trade 事件先于 async_response 到达**（Issue #51）：两条回调走不同通道——`async_response` 在异步下单工作线程触发，`order`/`trade` 来自 Redis pub/sub 监听线程；服务端 `order_callback` 先推事件、后回 RPC，顺序颠倒是常态。客户端按 `order_remark` 设屏障：命中待响应委托的事件先暂存，response（或 error）触发后按到达顺序放行；10 秒超时兜底，提交失败的事件也不会被永久扣住（丢事件比顺序错乱更糟）。仅 `order_stock_async` 路径受影响，手工/同步/无 remark 委托直通。成交事件无 remark 时按委托事件学到的 `order_sys_id` 关联。已验证：9 个单测（含 4 个反向验证）+ 盘后真实 Redis 注入实测 + 盘中 3 轮真实买卖验证（async_response 均先于 order/trade 到达，买单 50→54 撤单成功，卖单无持仓 50→57 废单正确上报）。
 - **重复 order_remark 导致暂存事件丢失**（Issue #51 后续）：`order_remark` 不强制唯一（网格类策略常复用同一 remark），同 remark 的第二笔下单会让 `_arm_order_barrier` 直接覆盖前一笔的屏障，暂存事件被静默丢弃；且前一笔的 response 会误放后一笔的屏障，使后一笔失去保序。改为接管旧屏障时先放行其暂存事件；`_release_order_barrier` 增加 seq 校验，只有 arm 时的那笔委托的 response 才能放行对应屏障。回归测试对任一半修复回退均失败。
 - **download_history_data2 只下载当天数据**（Issue #54）：部分 QMT 版本只注入单股下载全局 `down_history_data`，而捕获列表只有 `download_history_data/2` → 下载 RPC 静默返回 False、什么都没下，读取只能看到当天数据。捕获列表补 `down_history_data`；`download_history_data2` 无批量全局时按代码循环调用单股全局（日期透传）；`_handle_download_history_data` 同步兜底。修正 DRYRUN 里恒为 False 的下载绑定诊断打印。
@@ -1673,6 +1845,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 ## [0.2.2] - 2026-08-19
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **server_error 污染后续查询**（Issue #43）：`_last_server_error` 是实例状态，但每个成功响应都会读取它，而只有下单路径会重置。一次静默拒绝的委托会把错误盖到之后**所有** ping 和查询上，直到下一次下单。改为在 `handle()` 中每请求清空，且清空发生在方法校验之前，因此被拒绝的方法也不会携带上一次的诊断。
 - **order_remark 匹配的模糊兜底**（Issue #41）：那段 `stock_code + action` 的兜底并非用于*识别*委托，而是**告警闸门**——问题比报告描述的更严重。`order_tag` 是我们生成的唯一 id，匹配不上即真未进系统；模糊兜底唯一的作用是**压制真实告警**：账户中若有一笔无关的同股票同方向委托（手动下的或上一笔未成交的），会导致 `order_sys_id` 未回填、`server_error` 为空，客户端看到一次干净的成功，而该委托从未进入系统。已移除。
@@ -1703,6 +1879,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 ## [0.2.1] - 2026-08-17
 
 ### 修复
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **正常下单误报 on_order_error(-1)**（Issue #38）：passorder 提交成功但委托号异步分配，客户端把「暂无 order_sys_id」误判为失败。服务端 `_handle_submit_order` 按唯一 `user_order_id`(remark) 匹配并回填 `order_sys_id`；顺带修掉校验代码对无 `.get()` 方法的 `OrderSnapshot` 调 `.get()` 的死代码（server_error 之前从未生效）。客户端 `call()` 不再丢弃 `server_error`，委托未进系统时转成异常，`order_stock_async` 携带真实原因回调 `on_order_error`。实盘验证：async 下单回调带真实委托号、提交阶段零误报（302 个测试通过，新增 5 个）。
 - **query_stock_orders 查不到委托**（strategy_name 陷阱）：客户端别名默认 `"bigqmt_signal_trader"` 与服务端默认 `""` 不一致，改用其他策略名下单后别名查询返回空。默认改 `""`（返回全部）并对齐测试。
@@ -1738,6 +1918,10 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 - **MiniQMT→BigQMT 转换 skill**：docs + scripts + templates（PR #37）。
 
 ### 修复（Bug Fixes）
+
+- **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
+
+- **全推订阅心跳循环不再被重放异常打死**（#231）。`WholeQuoteClientSession._heartbeat_loop` 里两处 `replay_subscriptions()` 的 RPC 异常曾逃出循环——心跳线程死了但 `_started` 仍为 True，`start()` 永不重启，订阅在客户端「以为还订着」的状态下被服务端收割器清掉。现在重放失败按下一轮重试处理，`start()` 只在心跳线程**活着**时才算已启动。
 
 - **QMT 自动退出**：`ZmqQuotePushChannel.stop()` 跨线程关 SUB socket 触发 Windows signaler abort → 进程崩溃。改为订阅线程自己关 socket。
 - **QMT 自动退出（系列）**：`_adjust_phase` 无 except（redis 故障崩策略）、`_publish_response` 逃出、deal_callback/forward_order_event/forward_trade_event/sync_positions_app 无防护、pending 队列满（queue.Full）、init() 无防护、socket_timeout=None 永久阻塞主线程、reset_app 不清理 quote-push/whole-quote（重启泄漏）、exec 事件每次回调新建 redis client（连接池泄漏）。
