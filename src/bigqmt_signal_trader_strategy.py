@@ -585,18 +585,38 @@ def _resolve_background_threads(transport_name, configured):
     each time a background thread acquires the GIL costs ~1 adjust tick
     (~100ms), which is where the round trip actually goes (#104).
 
-    Only zmq/mysql implement drain_request_queue, so only they honor the
+    Only transports that implement a *real* drain_request_queue may honor the
     override; anything else keeps the receiver thread it needs to be polled by.
     Redis honors either value (blocking brpop path AND an adjust lpop drain).
+
+    The list used to be a hardcoded ("zmq", "mysql") and a new transport had to
+    remember to add itself -- pipe did not, so an explicit False was silently
+    forced back to True and the drain never ran (the log said
+    ``background_threads=True`` while the config said False). Ask the transport
+    class instead: it is the thing that knows.
     """
     normalized = str(transport_name or "redis").lower()
     if _is_redis_transport(normalized):
         return bool(configured)
     if configured is None:
         return True
-    if normalized in ("zmq", "mysql"):
+    if _transport_can_drain(normalized):
         return bool(configured)
     return True
+
+
+def _transport_can_drain(transport_name):
+    """这个传输自己实现了 drain_request_queue 吗。
+
+    问传输类本身，而不是维护一张名单 —— 名单会漏，pipe 就漏过一次。
+    基类的实现返回 0（占位），所以只认子类自己覆盖过的。
+    """
+    try:
+        from bigqmt_signal_trader.transports.factory import transport_supports_drain
+    except Exception:
+        # 导入不到就退回历史名单，别让一个 import 失败改变行为
+        return str(transport_name or "").lower() in ("zmq", "mysql")
+    return transport_supports_drain(transport_name)
 
 
 def _build_quote_subscription_service(context_info, config, transport_name, account_id, redis_client):

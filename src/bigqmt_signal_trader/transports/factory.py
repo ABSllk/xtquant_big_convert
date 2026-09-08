@@ -11,7 +11,40 @@ from .base import RpcTransport
 from .redis_transport import RedisTransport
 
 
-KNOWN_TRANSPORTS = ("redis", "zmq", "mysql", "shm")
+KNOWN_TRANSPORTS = ("redis", "zmq", "mysql", "shm", "pipe")
+
+
+def transport_supports_drain(name):
+    """这个传输自己实现了 drain_request_queue 吗（不构造实例）。
+
+    调用方要判断「能不能走 adjust 轮询」，而**构造实例是有副作用的** ——
+    建 redis 连接、起线程。用它做探测污染过测试环境一次，所以这里只导入
+    模块、比对类属性，不 build。
+
+    工厂是「有哪些传输」的唯一来源，这个判断也该在这里，而不是让调用方
+    各自维护一张名单（pipe 就是在别处的名单里漏掉，导致 drain 从未生效）。
+    """
+    from .base import RpcTransport
+
+    name = str(name or "redis").lower()
+    try:
+        if name in ("redis", "", "default"):
+            from .redis_transport import RedisTransport as cls
+        elif name == "zmq":
+            from .zmq_transport import ZmqTransport as cls
+        elif name == "mysql":
+            from .mysql_transport import MysqlTransport as cls
+        elif name == "pipe":
+            from .pipe_transport import NamedPipeTransport as cls
+        else:
+            return False
+    except ImportError:
+        # 缺依赖（没装 pyzmq / mysql 驱动）是合法的「不支持」。但类名写错也会
+        # 走到这里 —— MySqlTransport / MysqlTransport 就错过一次，被静默吞成
+        # False。所以只吞 ImportError，AttributeError 之类必须炸出来。
+        return False
+    own = getattr(cls, "drain_request_queue", None)
+    return own is not None and own is not getattr(RpcTransport, "drain_request_queue", None)
 
 
 def build_transport(
@@ -36,6 +69,20 @@ def build_transport(
         return _build_zmq(config, account_id, print_prefix)
     if name == "mysql":
         return _build_mysql(config, account_id, print_prefix)
+    if name == "pipe":
+        # Windows named pipe: no third-party package, no socket. The only wire
+        # that works on a terminal whose import whitelist rejects socket and
+        # whose bundled Python cannot pip install.
+        from .pipe_transport import NamedPipeTransport
+
+        pipe_config = dict(config.get("pipe") or {})
+        return NamedPipeTransport(
+            account_id=account_id,
+            print_prefix=print_prefix,
+            pipe_name=pipe_config.get("pipe_name") or "bigqmt_rpc",
+            connect_timeout_seconds=float(
+                pipe_config.get("connect_timeout_seconds") or 5.0),
+        )
     if name == "shm":
         return _build_shm(config, account_id, print_prefix)
     raise ValueError(
