@@ -34,6 +34,7 @@ Deployments that need those keep Redis or ZMQ.
 import ctypes
 import json
 import os
+import queue
 import threading
 import time
 
@@ -116,14 +117,6 @@ class NamedPipeTransport(RpcTransport):
         # DEALER, and the reason that fix is not worth repeating here.
         self._client_local = threading.local()
         self._client_handles = []
-        # One lock per server-side connection: inline answers are written from
-        # the connection's worker thread while deferred answers (orders,
-        # positions, anything in LISTENER_DEFERRED_METHODS) are written from
-        # the adjust thread. Two threads writing one message-mode handle at
-        # once interleave frames and the client sees garbage -- the live
-        # "deferred methods never get a response" defect. Message mode does
-        # NOT make cross-thread writes atomic.
-        self._write_locks = {}
         # 读缓冲也按线程持有 —— 见 _read_buffer 里的实测数字。
         self._io_local = threading.local()
 
@@ -160,15 +153,20 @@ class NamedPipeTransport(RpcTransport):
         return buf
 
     def _read(self, handle):
+        """Read one message; b"" only for a CancelIoEx wake, raise for a real close.
+
+        Two outcomes MUST be told apart now that writes are driven by waking
+        the reader: CancelIoEx (a writer woke us so we can write) returns
+        ERROR_OPERATION_ABORTED -- that is a wake, not a close; a peer going
+        away (ERROR_BROKEN_PIPE / ERROR_INVALID_HANDLE) IS a close and the
+        connection is over.
+        """
         dll = self._dll()
         buf = self._read_buffer()
         read = self._wintypes.DWORD()
         chunks = []
         while True:
             ok = dll.ReadFile(handle, buf, _BUFFER_BYTES, ctypes.byref(read), None)
-            # string_at 只拷实际读到的字节。buf.raw 会先把整个 1MB 缓冲区
-            # 复制成 bytes 再切片 —— 和上面那个每次分配 1MB 是同一类错误，
-            # 实测占掉往返的一半时间。
             if read.value:
                 chunks.append(ctypes.string_at(buf, read.value))
             if ok:
@@ -176,10 +174,11 @@ class NamedPipeTransport(RpcTransport):
             err = self._last_error()
             if err == ERROR_MORE_DATA:
                 continue
-            # 停机路径：CancelIoEx 取消了这次读、句柄被关掉、或对端断开。
-            # 这些都是正常收尾，不该当成错误抛出去把日志刷满。
-            if err in (ERROR_OPERATION_ABORTED, ERROR_INVALID_HANDLE,
-                       ERROR_BROKEN_PIPE) or not self._running:
+            if err == ERROR_OPERATION_ABORTED:
+                return b""          # a writer woke us to write; not a close
+            if err in (ERROR_INVALID_HANDLE, ERROR_BROKEN_PIPE):
+                raise TransportError("pipe closed (err=%s)" % err)
+            if not self._running:
                 return b""
             if not chunks or not chunks[0]:
                 return b""
@@ -305,7 +304,6 @@ class NamedPipeTransport(RpcTransport):
                 continue
             with self._server_lock:
                 self._server_handles.append(handle)
-                self._write_locks[handle] = threading.Lock()
             connected = dll.ConnectNamedPipe(handle, None)
             if not connected and self._last_error() != ERROR_PIPE_CONNECTED:
                 self._close_server_handle(handle)
@@ -320,24 +318,50 @@ class NamedPipeTransport(RpcTransport):
             worker.start()
 
     def _serve_connection(self, handle):
+        """One connection, single-threaded I/O: reads AND writes happen here.
+
+        This is the deferred-answer defect, finally explained: a deferred
+        answer is produced on the adjust thread while this worker sits in a
+        blocking ReadFile -- and a synchronous handle does not tolerate a
+        WriteFile concurrent with a pending ReadFile (measured: the write
+        blocks forever, or fails err=232 ERROR_NO_DATA). So nobody may write
+        except this thread. send_response on any thread only QUEUES into the
+        outbox and CancelIoEx's the pending read; this loop then writes the
+        payload itself. Write-before-read ordering plus the writer's
+        queue-before-cancel ordering means a cancelled-for payload is always
+        visible when the aborted read returns.
+        """
+        outbox = queue.Queue()
         try:
             while self._running:
+                while not outbox.empty():
+                    self._write(handle, outbox.get())
                 try:
                     raw = self._read(handle)
                 except TransportError:
-                    break
+                    return
                 if not raw:
-                    break
+                    # Woken by a writer (payload comes out at the top of the
+                    # loop) or by stop(). Not a close -- a real close raises.
+                    continue
                 try:
                     request = json.loads(decode_text(raw))
                 except Exception:
-                    break
-                # Remember which handle to answer on. send_response reads it
-                # back, so a handler that replies inline reaches the right peer
-                # even with several clients connected at once.
+                    return
+                # Remember which outbox to answer on. send_response reads it
+                # back, so inline and deferred answers both reach this peer.
                 request["_pipe_handle"] = handle
+                request["_pipe_outbox"] = outbox
                 self.deliver(request)
         finally:
+            # Flush whatever is queued before closing: the reload reply is a
+            # deferred answer, and a stop() that swallows it is exactly the
+            # reload self-teardown defect.
+            try:
+                while not outbox.empty():
+                    self._write(handle, outbox.get())
+            except Exception:
+                pass
             self._close_server_handle(handle)
 
     def drain_request_queue(self, max_items=20):
@@ -353,17 +377,21 @@ class NamedPipeTransport(RpcTransport):
         return 0
 
     def send_response(self, request, response):
+        """Queue the answer onto the connection's outbox and wake its worker.
+
+        Never writes directly: only the connection worker may write (a
+        synchronous handle does not tolerate a WriteFile concurrent with a
+        pending ReadFile -- the deferred-answer defect). The worker queues
+        BEFORE cancelling, so the payload is always visible by the time the
+        aborted read returns.
+        """
         handle = (request or {}).get("_pipe_handle")
-        if handle is None:
+        outbox = (request or {}).get("_pipe_outbox")
+        if handle is None or outbox is None:
             raise TransportError("no pipe handle on the request to reply to")
         payload = json.dumps(response, ensure_ascii=False, default=str).encode("utf-8")
-        with self._server_lock:
-            lock = self._write_locks.get(handle)
-        if lock is not None:
-            with lock:
-                self._write(handle, payload)
-        else:
-            self._write(handle, payload)
+        outbox.put(payload)
+        self._cancel_read(handle)
 
     def _close_server_handle(self, handle):
         # 先把句柄从表里摘掉，摘到的那个线程才负责真正关闭。stop() 和工作线程
@@ -373,7 +401,6 @@ class NamedPipeTransport(RpcTransport):
             if handle not in self._server_handles:
                 return
             self._server_handles.remove(handle)
-            self._write_locks.pop(handle, None)
         dll = self._dll()
         # **必须先取消挂起的 I/O。** DisconnectNamedPipe 会等同一句柄上挂起的
         # 同步 ReadFile 完成，而工作线程正阻塞在那个 ReadFile 上等下一个请求 ——
