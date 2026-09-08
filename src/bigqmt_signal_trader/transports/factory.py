@@ -11,7 +11,7 @@ from .base import RpcTransport
 from .redis_transport import RedisTransport
 
 
-KNOWN_TRANSPORTS = ("redis", "zmq", "mysql", "shm")
+KNOWN_TRANSPORTS = ("redis", "zmq", "mysql", "shm", "pipe")
 
 
 def build_transport(
@@ -36,6 +36,20 @@ def build_transport(
         return _build_zmq(config, account_id, print_prefix)
     if name == "mysql":
         return _build_mysql(config, account_id, print_prefix)
+    if name == "pipe":
+        # Windows named pipe: no third-party package, no socket. The only wire
+        # that works on a terminal whose import whitelist rejects socket and
+        # whose bundled Python cannot pip install.
+        from .pipe_transport import NamedPipeTransport
+
+        pipe_config = dict(config.get("pipe") or {})
+        return NamedPipeTransport(
+            account_id=account_id,
+            print_prefix=print_prefix,
+            pipe_name=pipe_config.get("pipe_name") or "bigqmt_rpc",
+            connect_timeout_seconds=float(
+                pipe_config.get("connect_timeout_seconds") or 5.0),
+        )
     if name == "shm":
         return _build_shm(config, account_id, print_prefix)
     raise ValueError(
