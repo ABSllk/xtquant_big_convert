@@ -655,10 +655,7 @@ class BigQmtOrderGateway:
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 
     def query_orders(self, account_id, strategy_name):
-        try:
-            return self.query_orders_strict(account_id, strategy_name)
-        except Exception:
-            return []
+        return self.query_orders_strict(account_id, strategy_name)
 
     def query_orders_strict(self, account_id, strategy_name):
         query = self._require_query_func()
@@ -742,28 +739,16 @@ class BigQmtOrderGateway:
         return result
 
     def query_trades(self, account_id, strategy_name):
-        try:
-            return self.query_trades_strict(account_id, strategy_name)
-        except Exception:
-            return []
+        return self.query_trades_strict(account_id, strategy_name)
 
     def query_trades_strict(self, account_id, strategy_name):
         query = self._require_query_func()
         account_type = self._resolve_account_type(account_id)
-        rows = []
-        last_error = None
-        for detail_type in ("DEAL", "TRADE"):
-            try:
-                if str(strategy_name or "").strip():
-                    rows = query(account_id, account_type, detail_type, strategy_name) or []
-                else:
-                    rows = query(account_id, account_type, detail_type) or []
-                if rows:
-                    break
-            except Exception as exc:
-                last_error = exc
-        if not rows and last_error is not None:
-            raise last_error
+        # DEAL is the documented trade detail type; an empty result is a success.
+        if str(strategy_name or "").strip():
+            rows = query(account_id, account_type, "DEAL", strategy_name) or []
+        else:
+            rows = query(account_id, account_type, "DEAL") or []
         result = []
         account_type_code = self._account_type_code(account_id)
         name_cache = {}

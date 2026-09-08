@@ -9,7 +9,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
+from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
+from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
 from bigqmt_signal_trader.models import (
     AssetSnapshot,
     CancelResult,
@@ -522,6 +524,38 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertIn("not found in system", response["server_error"])
 
+    def test_native_lookup_error_keeps_submission_without_resubmitting(self):
+        submissions = []
+        queries = []
+
+        def query(*args):
+            queries.append(args)
+            raise RuntimeError("simulated native ORDER query failure")
+
+        gateway = BigQmtOrderGateway(
+            context_info=None,
+            passorder_func=lambda *args: submissions.append(args),
+            get_trade_detail_data_func=query,
+        )
+        redis_client, service = self._service(gateway)
+        self._submit(service)
+        service.drain_pending()
+
+        response_key = "bigqmt:rpc:resp:acct:ord-1"
+        self.assertIn(response_key, redis_client.kv)
+        response = json.loads(redis_client.kv[response_key])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertEqual(response["data"]["status"], "SUBMITTED")
+        self.assertIsNone(response["data"]["order_sys_id"])
+        self.assertEqual(response["data"]["message"], "passorder submitted")
+        self.assertEqual(response["server_error"], "")
+        self.assertEqual(service.pending_settlement_count(), 0)
+
+        service.drain_pending()
+        service.drain_pending()
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(queries, [("acct", "STOCK", "ORDER", "")])
+
     def test_settlement_error_does_not_leak_into_other_responses(self):
         """issue #43 again, by another route: settling happens long after the
         order left the handler, so its diagnostic must ride on the settlement
@@ -945,6 +979,84 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["data"]["600000.SH"]["available"], 800)
         self.assertEqual(redis_client.published[0][0], "bigqmt:rpc:resp:acct:req-1")
+
+    def test_native_query_failure_becomes_rpc_error(self):
+        cases = (
+            ("get_positions", "POSITION"), ("query_stock_positions", "POSITION"),
+            ("query_orders", "ORDER"), ("query_stock_orders", "ORDER"),
+            ("query_trades", "DEAL"), ("query_stock_trades", "DEAL"),
+            ("query_execution_snapshot", "ORDER"), ("query_execution_snapshot", "DEAL"),
+        )
+        for method, failed_type in cases:
+            with self.subTest(method=method, failed_type=failed_type):
+                calls = []
+
+                def query(account_id, account_type, detail_type, *args):
+                    self.assertEqual((account_id, account_type), ("acct", "STOCK"))
+                    calls.append(detail_type)
+                    if detail_type == failed_type:
+                        raise RuntimeError("simulated native %s query failure" % failed_type)
+                    return []
+
+                redis_client, service = _service()
+                service.handlers.position_provider = BigQmtPositionProvider(query)
+                service.handlers.order_gateway = BigQmtOrderGateway(
+                    context_info=None, get_trade_detail_data_func=query)
+                service.enqueue_payload({
+                    "request_id": method,
+                    "account_id": "acct",
+                    "method": method,
+                    "params": {},
+                })
+                self.assertEqual(service.drain_pending(), 1)
+                response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:" + method])
+                self.assertFalse(response["ok"])
+                self.assertIsNone(response["data"])
+                self.assertEqual(response["error"],
+                                 "RuntimeError: simulated native %s query failure" % failed_type)
+                expected_calls = (["ORDER", "DEAL"]
+                                  if method == "query_execution_snapshot" and failed_type == "DEAL"
+                                  else [failed_type])
+                self.assertEqual(calls, expected_calls)
+
+    def test_native_empty_queries_remain_successful_rpc_results(self):
+        cases = (
+            ("get_positions", ["POSITION"], {}),
+            ("query_stock_positions", ["POSITION"], {}),
+            ("query_orders", ["ORDER"], []), ("query_stock_orders", ["ORDER"], []),
+            ("query_trades", ["DEAL"], []), ("query_stock_trades", ["DEAL"], []),
+            ("query_execution_snapshot", ["ORDER", "DEAL"], None),
+        )
+        for method, expected_calls, empty_result in cases:
+            with self.subTest(method=method):
+                calls = []
+
+                def query(account_id, account_type, detail_type, *args):
+                    calls.append(detail_type)
+                    if detail_type not in ("POSITION", "ORDER", "DEAL"):
+                        raise ValueError("unsupported detail type: " + detail_type)
+                    return []
+
+                redis_client, service = _service()
+                service.handlers.position_provider = BigQmtPositionProvider(query)
+                service.handlers.order_gateway = BigQmtOrderGateway(
+                    context_info=None, get_trade_detail_data_func=query)
+                service.enqueue_payload({
+                    "request_id": method,
+                    "account_id": "acct",
+                    "method": method,
+                    "params": {},
+                })
+                self.assertEqual(service.drain_pending(), 1)
+                response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:" + method])
+                self.assertTrue(response["ok"], response["error"])
+                if method == "query_execution_snapshot":
+                    self.assertEqual(response["data"]["orders"], [])
+                    self.assertEqual(response["data"]["trades"], [])
+                else:
+                    self.assertEqual(response["data"], empty_result)
+                self.assertEqual(response["error"], "")
+                self.assertEqual(calls, expected_calls)
 
     def test_process_in_listener_handles_request_without_waiting_for_drain(self):
         redis_client, service = _service(process_in_listener=True)
