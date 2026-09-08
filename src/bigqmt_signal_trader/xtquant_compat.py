@@ -551,6 +551,34 @@ def _qmt_stime_index(value):
     return str(value or "")
 
 
+_EPOCH_PLACEHOLDER_FLOOR = "19900101"
+
+
+def _is_epoch_placeholder_label(value):
+    """True for a bar label that predates the A-share market itself (#228).
+
+    Asked for a window it has no data for, big QMT does not answer with zero
+    rows -- it answers with one row stamped at the epoch (`stime` `19700101`,
+    OHLC and volume all zero). miniQMT returns an empty frame there, and that
+    is the contract this bridge promises.
+
+    The row is not harmless: a caller walking rows to derive period boundaries
+    reads it as a real bar and asks the calendar for `1969-12-29~1970-01-04`.
+    One downstream instance died on exactly that at 09:11 pre-open and idled
+    until someone stopped it, having already persisted `bar_time=1970-01-01`
+    rows that needed cleaning by hand.
+
+    The floor is the market's own start, not a tuning knob: the Shanghai
+    exchange opened in December 1990, so nothing earlier can be a real bar. A
+    zero row on a *plausible* date is left alone -- a suspended day is
+    legitimately zero-volume, and `fill_data=True` fills gaps on purpose.
+    """
+    digits = _digits_only(value)
+    if len(digits) < 8:
+        return False
+    return digits[:8] < _EPOCH_PLACEHOLDER_FLOOR
+
+
 def _iso_week_start_label(value):
     """The Monday of the ISO week a ``1w`` bar label belongs to, as YYYYMMDD.
 
@@ -687,6 +715,15 @@ def _normalize_market_data_frame(df, field_list=None):
                 _qmt_datetime_to_epoch_ms(parsed) if parsed is not None else None
                 for parsed in (_parse_qmt_stime(value) for value in stimes)
             ]
+        # Drop big QMT's "no data for this window" placeholders (#228). Done
+        # after the derived columns are built, and by position, so the rows
+        # that stay keep the values that belong to them.
+        keep = [
+            position for position, value in enumerate(stimes)
+            if not _is_epoch_placeholder_label(value)
+        ]
+        if len(keep) != len(stimes):
+            out = out.iloc[keep]
         if requested:
             keep = [field for field in requested if field in out.columns]
             if keep:
