@@ -31,6 +31,7 @@ The same live run also settled two smaller questions:
 import json
 import os
 import sys
+import time
 import unittest
 
 
@@ -154,13 +155,13 @@ class IdentityMapTest(unittest.TestCase):
 
         self.assertEqual(found["bq:abc:sig-1"]["strategy_name"], "alpha")
 
-    def test_a_failing_mget_falls_back_to_gets(self):
+    def test_a_failing_mget_does_not_multiply_socket_timeouts(self):
         redis = FakeRedis({self.key: _identity("alpha", "bq:abc:sig-1")}, fail=True)
 
         found = order_identity_map(redis, ACCOUNT, ["bq:abc:sig-1"])
 
-        self.assertEqual(found["bq:abc:sig-1"]["strategy_name"], "alpha")
-        self.assertEqual(redis.gets, [self.key])
+        self.assertEqual(found, {})
+        self.assertEqual(redis.gets, [])
 
     def test_no_redis_is_an_empty_answer_not_a_crash(self):
         self.assertEqual(order_identity_map(None, ACCOUNT, ["bq:abc:sig-1"]), {})
@@ -317,6 +318,29 @@ class AttributionTest(unittest.TestCase):
 
         self.assertEqual(named[0].strategy_name, "")
         self.assertEqual(len(named), 1)
+
+    def test_optional_remote_lookup_can_be_disabled(self):
+        rows = [Row(user_order_id="bq:abc:sig-1", strategy_name="")]
+        handlers = self._handlers(self.redis)
+        handlers.order_identity_remote_lookup_enabled = False
+
+        named = handlers._attribute_to_strategies(ACCOUNT, rows)
+
+        self.assertEqual(named[0].strategy_name, "")
+        self.assertEqual(self.redis.mgets, [])
+
+    def test_local_journal_still_wins_when_remote_lookup_is_disabled(self):
+        rows = [Row(user_order_id="bq:abc:sig-1", strategy_name="QMT bridge")]
+        handlers = self._handlers(self.redis)
+        handlers.order_identity_remote_lookup_enabled = False
+        handlers._order_identity_local = {
+            (ACCOUNT, "bq:abc:sig-1"): (time.time(), "alpha")
+        }
+
+        named = handlers._attribute_to_strategies(ACCOUNT, rows)
+
+        self.assertEqual(named[0].strategy_name, "alpha")
+        self.assertEqual(self.redis.mgets, [])
 
     def test_an_exploding_redis_does_not_lose_the_rows(self):
         """Attribution is a nicety; the query result is not."""

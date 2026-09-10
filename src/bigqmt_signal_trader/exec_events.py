@@ -529,7 +529,11 @@ def order_identity_map(redis_client, account_id, user_order_ids, limit=500):
         try:
             raws = mget(keys)
         except Exception:
-            raws = None
+            # Redis supports MGET on every supported server version.  A
+            # failure here normally means the optional backend is unavailable;
+            # retrying every key separately multiplies one socket timeout into
+            # N timeouts on QMT's main strategy thread.
+            return {}
     if raws is None:
         raws = []
         for key in keys:

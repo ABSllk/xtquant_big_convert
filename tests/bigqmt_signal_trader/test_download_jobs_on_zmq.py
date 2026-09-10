@@ -48,6 +48,13 @@ class WiringTest(unittest.TestCase):
         self.assertIn("handlers.download_job_redis_client = _store_redis", self.source)
         self.assertIn("handlers.order_identity_redis_client = _store_redis", self.source)
 
+    def test_optional_identity_reads_default_off_for_zmq(self):
+        self.assertIn(
+            "handlers.order_identity_remote_lookup_enabled = _config_bool(",
+            self.source,
+        )
+        self.assertIn("_is_redis_transport(transport_name)", self.source)
+
     def test_the_client_falls_back_past_the_transport(self):
         self.assertIn(
             "_store_redis = response_redis_client or redis_client "

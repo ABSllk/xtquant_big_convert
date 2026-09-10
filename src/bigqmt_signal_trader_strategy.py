@@ -768,6 +768,16 @@ def _build_rpc_service(context_info, app, config):
     _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
+    # Query responses run on QMT's main strategy thread.  In ZMQ mode Redis is
+    # only an optional side channel, and redis-py does not connect until the
+    # first command; an unreachable optional Redis must not hold every ZMQ RPC
+    # response hostage.  Redis transport deployments retain the persistent
+    # cross-process lookup because Redis is already their required wire.
+    identity_config = dict(config.get("order_identity") or {})
+    handlers.order_identity_remote_lookup_enabled = _config_bool(
+        identity_config.get("remote_query_enabled"),
+        _is_redis_transport(transport_name),
+    )
     # Settlement reads the callback-fed watch table first (issue #164).
     handlers.order_watch_table = _order_watch_table
     # Whether _pump_download_jobs will actually run queued jobs. The submit RPC

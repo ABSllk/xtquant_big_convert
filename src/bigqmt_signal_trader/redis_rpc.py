@@ -1612,7 +1612,17 @@ class BigQmtRpcHandlers:
         if not candidates:
             return rows
         redis_client = self._identity_redis()
-        if redis_client is not None:
+        # A ZMQ deployment must not depend on its optional Redis side channel
+        # to answer account/order/trade queries.  redis-py connects lazily, so
+        # merely building the optional client succeeds even when no Redis
+        # server is reachable; the first MGET here can then block QMT's main
+        # strategy thread until every RPC caller has timed out.  The local
+        # submit journal below still restores names for orders placed by this
+        # bridge process.  Redis transports keep the cross-process/persistent
+        # lookup because Redis is already their required, live request path.
+        remote_lookup = getattr(
+            self, "order_identity_remote_lookup_enabled", True)
+        if redis_client is not None and remote_lookup:
             try:
                 from .exec_events import order_identity_map
 
